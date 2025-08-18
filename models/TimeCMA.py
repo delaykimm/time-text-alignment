@@ -403,3 +403,179 @@ class Dual(nn.Module):
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         print(f"✅ Saved plot to {save_path}")
+    
+    @staticmethod
+    def visualize_common_embeddings(
+        ts_z: torch.Tensor,
+        txt_z: torch.Tensor,
+        save_path: str = "common_embed.png",
+        method: str = "pca",
+        reduce_mode: str = "mean_b",  # 'first_b' | 'mean_b' | 'flatten_bn' | 'mean_bn'
+        standardize: bool = True,       # 시각화 전 표준화(z-score) 여부
+        max_points: int = 5000,         # 너무 많으면 성능 위해 샘플링
+        random_state: int = 42,         # 재현성
+        title: str | None = None,
+        figsize=(7, 6),
+        alpha: float = 0.7,
+        s: float = 24.0,
+        channel_labels: list[str] | None = None, # 옵션 : 채널 이름
+    ):
+        """
+        ts_z, txt_z: [N, D] 또는 [B, N, D]
+        reduce_mode:
+        - 'first_b'   : 첫 배치만 사용 → [N, D]
+        - 'mean_b'    : 배치 평균     → [N, D]  ← 추천
+        - 'flatten_bn': (B*N, D)로 펼쳐서 시각화
+        - 'mean_bn'   : 배치/노드 모두 평균 → [D]
+        """
+        def to_2d(t: torch.Tensor, how: str) -> torch.Tensor:
+            if t.dim() == 2:
+                return t
+            if t.dim() == 3:
+                B, N, D = t.shape
+                if how == "first_b":
+                    return t[0]                # [N, D]
+                elif how == "mean_b":
+                    return t.mean(dim=0)       # [N, D]
+                elif how == "flatten_bn":
+                    return t.reshape(B * N, D) # [B*N, D]
+                elif how == "mean_bn":
+                    return t.mean(dim=(0, 1))  # [D]
+                else:
+                    raise ValueError(f"Unknown reduce_mode: {how}")
+            raise ValueError(f"Expected 2D or 3D tensor, got {tuple(t.shape)}")
+
+        ts_z_2d  = to_2d(ts_z,  reduce_mode)
+        txt_z_2d = to_2d(txt_z, reduce_mode)
+
+        # 'mean_bn'이면 [D]가 되므로 2D로 확장
+        if ts_z_2d.dim() == 1:
+            ts_z_2d = ts_z_2d.unsqueeze(0)  # [1, D]
+        if txt_z_2d.dim() == 1:
+            txt_z_2d = txt_z_2d.unsqueeze(0)  # [1, D]
+
+        assert ts_z_2d.shape[1] == txt_z_2d.shape[1], \
+            f"Dim mismatch: {ts_z_2d.shape} vs {txt_z_2d.shape} (D must match)"
+
+        # 2) 텐서를 CPU numpy로 변환
+        Ts = ts_z_2d.detach().cpu().float().numpy()  # [M1, D]
+        Tx = txt_z_2d.detach().cpu().float().numpy() # [M2, D]
+
+        # 3) 너무 많은 점이면 샘플링 (성능/가독성)
+        rng = np.random.default_rng(random_state)
+        def maybe_subsample(A: np.ndarray, max_n: int) -> np.ndarray:
+            if A.shape[0] <= max_n:
+                return A
+            idx = rng.choice(A.shape[0], size=max_n, replace=False)
+            return A[idx]
+        # 양쪽을 독립적으로 샘플링(라벨 균형 유지)
+        Ts = maybe_subsample(Ts, max_points // 2 if max_points else Ts.shape[0])
+        Tx = maybe_subsample(Tx, max_points // 2 if max_points else Tx.shape[0])
+
+        # 4) 표준화(옵션) — 두 분포를 같은 스케일로
+        if standardize:
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            Z = np.vstack([Ts, Tx])          # [M1+M2, D]
+            Z = scaler.fit_transform(Z)
+        else:
+            Z = np.vstack([Ts, Tx])
+
+        # 5) 차원축소 (PCA 또는 t-SNE)
+        if method.lower() == "pca":
+            from sklearn.decomposition import PCA
+            reducer = PCA(n_components=2, random_state=random_state)
+            Z2 = reducer.fit_transform(Z)    # [M, 2]
+            sub_title = f"PCA (var: {reducer.explained_variance_ratio_.sum():.2f})"
+        elif method.lower() == "tsne":
+            from sklearn.manifold import TSNE
+            # perplexity는 표본 수보다 작아야 안정적
+            perplexity = min(30, max(5, (Z.shape[0] // 10)))
+            reducer = TSNE(
+                n_components=2,
+                perplexity=perplexity,
+                learning_rate="auto",
+                init="pca",
+                random_state=random_state,
+                verbose=False,
+            )
+            Z2 = reducer.fit_transform(Z)
+            sub_title = f"t-SNE (perp={perplexity})"
+        else:
+            raise ValueError("method must be 'pca' or 'tsne'")
+
+        # 6) 분리해서 색상/마커로 표시
+        m1 = Ts.shape[0]
+        xy_ts = Z2[:m1]
+        xy_tx = Z2[m1:]
+
+        plt.figure(figsize=figsize)
+        plt.scatter(xy_ts[:, 0], xy_ts[:, 1], s=s, alpha=alpha, label="TS embeddings", marker='o')
+        plt.scatter(xy_tx[:, 0], xy_tx[:, 1], s=s, alpha=alpha, label="TXT embeddings", marker='^')
+        
+        # 채널 라벨 표시(옵션) — reduce_mode가 [N,D]일 때만 의미 있음
+        if channel_labels and ts_z_2d.shape[0] == len(channel_labels):
+            for i, name in enumerate(channel_labels):
+                plt.annotate(name, (xy_ts[i, 0], xy_ts[i, 1]), fontsize=9, alpha=0.8)
+                if i < xy_tx.shape[0]:
+                    plt.annotate(name, (xy_tx[i, 0], xy_tx[i, 1]), fontsize=9, alpha=0.8)
+
+        ttl = title if title is not None else f"Common space visualization - {sub_title} | mode={reduce_mode}"
+        plt.title(ttl)
+        plt.xlabel("Component 1")
+        plt.ylabel("Component 2")
+        plt.legend(loc="best", frameon=True)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        print(f"✅ Saved common-embedding plot to {save_path}")
+ 
+    # def visualize_common_embeddings(ts_z: torch.Tensor,
+    #                             txt_z: torch.Tensor,
+    #                             save_path: str = "common_embed.png",
+    #                             method: str = "pca",
+    #                             perplexity: float = 30.0):
+    #     """
+    #     ts_z, txt_z: [N, D] 또는 [B, N, D]
+    #     reduce_mode:
+    #       - 'first_b'   : 첫 배치만 사용 → [N, D]
+    #       - 'mean_b'    : 배치 평균     → [N, D]  ← 추천
+    #       - 'flatten_bn': (B*N, D)로 펼쳐서 시각화
+    #       - 'mean_bn'   : 배치/노드 모두 평균 → [D] (-> [1,D]로 확장해서 표시)
+    #     method:
+    #       - 'pca'  : 빠르고 선형적 구조 파악
+    #       - 'tsne' : 비선형 군집/매니폴드 구조 파악(느릴 수 있음)
+    #     """
+    #     ts_z = ts_z.detach().cpu().float()
+    #     txt_z = txt_z.detach().cpu().float()
+    #     assert ts_z.shape == txt_z.shape and ts_z.dim() == 2, f"need same shape [N,D], got {ts_z.shape} vs {txt_z.shape}"
+    #     N, D = ts_z.shape
+
+    #     X = torch.cat([ts_z, txt_z], dim=0).numpy()  # [2N, D]
+
+    #     if method.lower() == "pca":
+    #         reducer = PCA(n_components=2, random_state=0)
+    #         XY = reducer.fit_transform(X)            # [2N, 2]
+    #     else:
+    #         from sklearn.manifold import TSNE
+    #         reducer = TSNE(n_components=2, perplexity=perplexity, init="pca", learning_rate="auto", random_state=0)
+    #         XY = reducer.fit_transform(X)
+
+    #     ts_xy  = XY[:N]
+    #     txt_xy = XY[N:]
+
+    #     plt.figure(figsize=(7,6))
+    #     # 점 찍기
+    #     plt.scatter(ts_xy[:,0],  ts_xy[:,1],  s=60, label="TS (time-series)", alpha=0.85)
+    #     plt.scatter(txt_xy[:,0], txt_xy[:,1], s=60, marker="^", label="TXT (prompt)", alpha=0.85)
+
+    #     # 같은 채널끼리 선 연결
+    #     for i in range(N):
+    #         plt.plot([ts_xy[i,0], txt_xy[i,0]], [ts_xy[i,1], txt_xy[i,1]], linewidth=1, alpha=0.5)
+
+    #     plt.title(f"Common-space alignment ({method.upper()})")
+    #     plt.legend()
+    #     plt.tight_layout()
+    #     plt.savefig(save_path, dpi=150)
+    #     plt.close()
+    #     print(f"✅ Saved common-space embedding plot to {save_path}")
