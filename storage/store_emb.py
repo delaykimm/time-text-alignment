@@ -85,49 +85,66 @@ def save_embeddings(args):
 
         print("Shape of last_token_emb:", last_token_emb.shape)     # [B, d_model, N]
         print("Shape of prompt_token_emb:", prompt_token_emb.shape) # [B, T_max, d_model, N]
+        #print(align_meta)
 
         # --- ② 채널별 anchor_avg 계산 ---
         # anchor_avg[b, n, d_llm] = 그 채널 prompt 안의 모든 "숫자 토큰 인덱스" 임베딩 평균
         B, T_max, d_llm, N = prompt_token_emb.shape
-        anchor_avg = torch.zeros((B, N, d_llm), device=device)
-        num_token_idx_all = []   # JSON 저장용 (배치마다 채널별 리스트)
-        num_values_all   = []    # JSON 저장용
+        anchor_avg = torch.zeros((B, N, d_llm), device=device)  # [B, N, d_llm]
+        num_token_idx_all = []   # JSON 저장용: per-batch, per-channel, per-time 의 토큰 인덱스 [[ [idx...], ... ], ...]
+        num_values_all   = []    # JSON으로 저장: per-batch, per-channel, per-time 의 실수 값 [ [v0,...], ... ]
 
+        def _clip_valid_ids(idxs, tmax):
+            # 음수/초과 제거
+            return [ii for ii in idxs if 0 <= ii < tmax]
+        
         for b in range(B):
-            num_token_idx_per_b = []
-            num_values_per_b    = []
+            num_token_idx_per_b = []  # 길이 N
+            num_values_per_b    = []  # 길이 N
             for n in range(N):
-                # meta[b][n]가 없다면 skip
-                entry = align_meta[b].get(n, None) if isinstance(align_meta[b], dict) else None
+                # align_meta[b][n] 는 길이 L 의 리스트: [(value_0, [tok_idx...]), ..., (value_{L-1}, [...])]
+                entry = align_meta[b][n] if isinstance(align_meta[b], (dict, list, tuple)) else None
+
                 if entry is None:
-                    # fallback: 마지막 토큰 하나만 anchor로
+                    # fallback
                     anchor_avg[b, n] = prompt_token_emb[b, -1, :, n]
-                    num_token_idx_per_b.append([])  # 빈 리스트
+                    num_token_idx_per_b.append([])
                     num_values_per_b.append([])
                     continue
 
-                value_index_pairs = entry.get("value_index_pairs", [])  # [(value, [idx, ...]), ...]
-                values            = entry.get("values", [])             # [float, float, ...]
-                # 숫자 토큰 인덱스 전부 합치기
-                all_token_idx = []
-                for _, idx_list in value_index_pairs:
-                    all_token_idx.extend(idx_list)
-                # valid 인덱스만 남기기
-                all_token_idx = [idx for idx in all_token_idx if 0 <= idx < T_max]
+                if isinstance(entry, dict):
+                    # dict 구조일 경우
+                    value_index_pairs = entry.get("value_index_pairs", [])
+                    values = entry.get("values", [])
+                else:
+                    # list/tuple 구조일 경우
+                    # entry = [(val, [tok_idx...]), ...]
+                    value_index_pairs = entry
+                    values = [val for val, _ in entry]
 
-                if len(all_token_idx) == 0:
-                    # 없으면 마지막 토큰 임베딩 사용
+                        # --- 여기 수정 ---
+                token_idx_lists = []
+                for val, idx_list in value_index_pairs:
+                    valid_idx = [idx for idx in idx_list if 0 <= idx < T_max]
+                    token_idx_lists.append(valid_idx)
+
+                # anchor 계산: 전체 합쳐 평균
+                flat_idx = [idx for sublist in token_idx_lists for idx in sublist]
+                if len(flat_idx) == 0:
                     anchor_avg[b, n] = prompt_token_emb[b, -1, :, n]
                 else:
-                    # [lenK, d_llm] 평균
-                    token_emb = prompt_token_emb[b, all_token_idx, :, n]  # [K, d_llm]
+                    token_emb = prompt_token_emb[b, flat_idx, :, n]
                     anchor_avg[b, n] = token_emb.mean(dim=0)
 
-                num_token_idx_per_b.append(all_token_idx)
-                num_values_per_b.append(values)
+                # --- 숫자별로 그대로 저장 ---
+                num_token_idx_per_b.append(token_idx_lists)   # [[idx_list_for_val1], [idx_list_for_val2], ...]
+                num_values_per_b.append(values)               # [val1, val2, ...]
 
             num_token_idx_all.append(num_token_idx_per_b)
             num_values_all.append(num_values_per_b)
+            
+        print(num_token_idx_all)
+        print(num_values_all)
 
         # --- ③ 저장 ---
         file_path = f"{save_path}{i}.h5"

@@ -167,19 +167,47 @@ class Dataset_ETT_hour(Dataset):
                 anchor_np = hf['anchor_avg'][:]                # [B, N, d_llm]  (B=1)
                 
                 # (옵션) 메타도 필요하면 읽기
-                # num_idx = json.loads(hf['num_token_idx_json'][()].decode())
+                raw_idx = json.loads(hf['num_token_idx_json'][()].decode())
                 # num_vals= json.loads(hf['num_values_json'][()].decode())
             
             last_emb   = torch.from_numpy(last_np).float().squeeze(0)     # [d_llm, N]
             prompt_emb = torch.from_numpy(prompt_np).float().squeeze(0)   # [T_max, d_llm, N]
             anchor_avg = torch.from_numpy(anchor_np).float().squeeze(0)   # [N, d_llm]
             
+            T_max = prompt_emb.shape[0]
+            N     = prompt_emb.shape[-1]
+            L     = seq_x.shape[0]  # 시점 길이
+
+            # ---- num_token_idx를 [L][N]으로 전치 ----
+            # 저장 당시 raw_idx = [B][N][L], 여기서는 B=1 가정 → raw_idx[0] = [N][L]
+            if not isinstance(raw_idx, list) or len(raw_idx) == 0:
+                # 안전장치: 비었으면 빈 리스트 리턴
+                num_token_idx = [[[] for _ in range(N)] for _ in range(L)]
+            else:
+                per_b = raw_idx[0]  # [N][L]
+                # 전치: [N][L] -> [L][N]
+                # 각 항목은 "그 숫자를 구성하는 토큰 인덱스 리스트"
+                # 또한 T_max 범위를 벗어나는 인덱스는 제거
+                num_token_idx = []
+                for t in range(L):
+                    row_t = []
+                    for n in range(N):
+                        # per_b[n][t] 가 리스트(= 그 시점의 숫자 토큰 인덱스들)여야 함
+                        idx_list = per_b[n][t] if (n < len(per_b) and t < len(per_b[n])) else []
+                        if not isinstance(idx_list, list):
+                            idx_list = []
+                        # 클리핑: 0 <= idx < T_max
+                        idx_list = [int(ix) for ix in idx_list if isinstance(ix, (int, float)) and 0 <= int(ix) < T_max]
+                        row_t.append(idx_list)
+                    num_token_idx.append(row_t)  # [N] (각 채널의 인덱스 리스트)
+                # 이제 num_token_idx는 [L][N] 구조   
         else:
             raise FileNotFoundError(f"No embedding file found at {file_path}")       
         
         # 모델에서 어떤 것을 쓸지에 따라 반환
         # 여기서는 last_emb + prompt_emb + anchor_avg 모두 리턴
-        return seq_x, seq_y, seq_x_mark, seq_y_mark, last_emb, prompt_emb, anchor_avg
+        # 추가:  num_token_idx  (shape: [L][N] = list of list of token_id list)
+        return seq_x, seq_y, seq_x_mark, seq_y_mark, last_emb, prompt_emb, anchor_avg, num_token_idx
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)

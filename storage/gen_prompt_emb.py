@@ -45,6 +45,7 @@ class GenPromptEmb(nn.Module):
         # self.model.wpe = new_wpe
         # ==== [REPLACE in __init__ tokenizer/model init] ====
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.tokenizer.pad_token = self.tokenizer.eos_token 
         self.model = GPT2Model.from_pretrained(model_name).to(self.device)
         self.model.eval()
         for p in self.model.parameters():
@@ -107,15 +108,15 @@ class GenPromptEmb(nn.Module):
         in_prompt = in_prompt.replace("Trends", trends_str)
         in_prompt = in_prompt.replace("[t1]", start_date).replace("[t2]", end_date)
 
-        # Tokenize with truncation to avoid too-long sequences
-        tokenized = self.tokenizer(
-            in_prompt,
-            return_tensors="pt",
-            return_offsets_mapping=True,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-        )
-        model_input = {k: v.to(self.device) for k, v in tokenized.items() if k != "offset_mapping"}
+        # # Tokenize with truncation to avoid too-long sequences
+        # tokenized = self.tokenizer(
+        #     in_prompt,
+        #     return_tensors="pt",
+        #     return_offsets_mapping=True,
+        #     truncation=True,
+        #     max_length=self.tokenizer.model_max_length,
+        # )
+        # model_input = {k: v.to(self.device) for k, v in tokenized.items() if k != "offset_mapping"}
 
         # Collect value-index pairs using enhanced matching
         value_index_pairs = []
@@ -133,9 +134,10 @@ class GenPromptEmb(nn.Module):
             # fallback: 마지막 값과 마지막 토큰
             value_index_pairs.append((float(values[-1]), [-1]))
             
-        # print(value_index_pairs)
+        #print(value_index_pairs)
+        #print(in_prompt)
 
-        return model_input, value_index_pairs  # list of (value, [token positions])
+        return in_prompt, value_index_pairs  # list of (value, [token positions])
 
     def forward(self, tokenized_prompt_dict):
         # tokenized_prompt_dict: output from tokenizer (input_ids, attention_mask, etc.)
@@ -230,49 +232,134 @@ class GenPromptEmb(nn.Module):
         B = in_data.shape[0]
         N = in_data.shape[2]
 
-        # 1) (i,j)별 프롬프트 생성 + 정렬 메타
+        # 1) (i,j)별 프롬프트 문자열 + 메타 생성
         prompts, meta = [], []
         align_meta = [[None for _ in range(N)] for _ in range(B)]
         for i in range(B):
             for j in range(N):
-                model_input, value_index_pairs = self._prepare_prompt(template, in_data, in_data_mark, i, j)
-                # _prepare_prompt 가 문자열을 반환하도록 유지
-                if isinstance(model_input, dict):
-                    # 기존 코드에 dict 반환이 섞여 있었다면 문자열 반환으로 정리하는 것이 베스트
-                    raise RuntimeError("Make _prepare_prompt return a string prompt for true batching.")
-                prompts.append(model_input)
+                prompt_str, value_index_pairs = self._prepare_prompt(template, in_data, in_data_mark, i, j)
+
+                # 혹시 실수로 list/tuple을 반환하면 문자열로 합침 (안전망)
+                if isinstance(prompt_str, (list, tuple)):
+                    prompt_str = "\n".join(map(str, prompt_str))
+                elif not isinstance(prompt_str, str):
+                    prompt_str = str(prompt_str)
+
+                prompts.append(prompt_str)
                 meta.append((i, j))
                 align_meta[i][j] = value_index_pairs
 
-        # 2) 배치 토크나이즈 → 한꺼번에 모델 forward (chunking)
+        # 2) 배치 토크나이즈 → 모델 forward (chunk 단위)
         all_hidden = []
-        step = self.batch_token_size
+        all_attn = []
+        step = getattr(self, "batch_token_size", 64)
+
         for s in range(0, len(prompts), step):
-            tok = self.tokenizer(prompts[s:s+step],
-                                return_tensors='pt',
-                                padding=True, truncation=True).to(self.device)
+            tok = self.tokenizer(
+                prompts[s:s+step],
+                return_tensors='pt',
+                padding=True,
+                truncation=True
+            ).to(self.device)
+
             with torch.cuda.amp.autocast():
                 out = self.model(**tok).last_hidden_state  # [m, L, d]
-            all_hidden.append(out)
-        hidden = torch.cat(all_hidden, dim=0)  # [M, L, d]
-        L = hidden.shape[1]
-        d = hidden.shape[2]
-        T_max = L
 
-        # 3) (i,j)별로 재배치 & 패딩 → [B, T_max, d_model, N], 마지막 토큰 추출
+            all_hidden.append(out)
+            all_attn.append(tok["attention_mask"])        # [m, L]
+
+        hidden = torch.cat(all_hidden, dim=0)  # [M, L, d]
+        attn   = torch.cat(all_attn,   dim=0)  # [M, L]
+
+        # 유효 토큰 길이(패딩 제외)와 T_max
+        lengths = attn.sum(dim=1)  # [M]
+        T_max = int(lengths.max().item())
+        d = hidden.shape[2]
+
+        # 3) (i,j)별로 재배치 & 패딩 → [B, T_max, d_model, N], 마지막 유효 토큰 추출
         prompt_token_emb = torch.zeros((B, T_max, d, N), device=hidden.device, dtype=hidden.dtype)
-        last_token_emb    = torch.zeros((B, d, N), device=hidden.device, dtype=hidden.dtype)
+        last_token_emb   = torch.zeros((B, d, N),         device=hidden.device, dtype=hidden.dtype)
 
         for k, (i, j) in enumerate(meta):
-            hij = hidden[k, :, :]  # [L, d]
-            # 길이 추정(여기선 L 그대로 사용; tokenizer padding으로 동일 L)
-            T_ij = L
-            if T_ij < T_max:
-                last = hij[-1:, :]
-                pad = last.repeat(T_max - T_ij, 1)
-                hij = torch.cat([hij, pad], dim=0)
+            L_k = int(lengths[k].item())
+            hij = hidden[k, :L_k, :]  # [L_k, d]  (패딩 제외)
+
+            if L_k < T_max:
+                last_valid = hij[-1:, :]
+                pad = last_valid.repeat(T_max - L_k, 1)
+                hij = torch.cat([hij, pad], dim=0)  # [T_max, d]
+
             prompt_token_emb[i, :, :, j] = hij
-            last_token_emb[i, :, j] = hij[-1, :]
+            last_token_emb[i, :, j]      = hij[L_k - 1, :]  # 마지막 유효 토큰
 
         return last_token_emb, prompt_token_emb, align_meta
+    # def generate_embeddings(self, in_data, in_data_mark):
+    #     """
+    #     반환:
+    #     last_token_emb: [B, d_model, N]
+    #     prompt_token_emb: [B, T_max, d_model, N]
+    #     align_meta:  align_meta[b][n] = [(value_t, [tok_idx...]), ...]
+    #     """
+    #     input_templates = {
+    #         'FRED':  "From [t1] to [t2], the values were value1, ..., valuen every month. The total trend value was Trends",
+    #         'ILI':   "From [t1] to [t2], the values were value1, ..., valuen every week. The total trend value was Trends",
+    #         'ETTh1': "From [t1] to [t2], the values were value1, ..., valuen every hour. The total trend value was Trends",
+    #         'ETTh2': "From [t1] to [t2], the values were value1, ..., valuen every hour. The total trend value was Trends",
+    #         'ECL':   "From [t1] to [t2], the values were value1, ..., valuen every hour. The total trend value was Trends",
+    #         'ETTm1': "From [t1] to [t2], the values were value1, ..., valuen every 15 minutes. The total trend value was Trends",
+    #         'ETTm2': "From [t1] to [t2], the values were value1, ..., valuen every 15 minutes. The total trend value was Trends",
+    #         'Weather': "From [t1] to [t2], the values were value1, ..., valuen every 10 minutes. The total trend value was Trends",
+    #     }
+    #     template = input_templates.get(self.data_path, input_templates['ETTh1'])
+
+    #     B = in_data.shape[0]
+    #     N = in_data.shape[2]
+
+    #     # 1) (i,j)별 프롬프트 생성 + 정렬 메타
+    #     prompts, meta = [], []
+    #     align_meta = [[None for _ in range(N)] for _ in range(B)]
+    #     for i in range(B):
+    #         for j in range(N):
+    #             model_input, value_index_pairs = self._prepare_prompt(template, in_data, in_data_mark, i, j)
+    #             # _prepare_prompt 가 문자열을 반환하도록 유지
+    #             if isinstance(model_input, dict):
+    #                 # 기존 코드에 dict 반환이 섞여 있었다면 문자열 반환으로 정리하는 것이 베스트
+    #                 raise RuntimeError("Make _prepare_prompt return a string prompt for true batching.")
+    #             prompts.append(model_input)
+    #             meta.append((i, j))
+    #             align_meta[i][j] = value_index_pairs
+
+    #     # 2) 배치 토크나이즈 → 한꺼번에 모델 forward (chunking)
+    #     all_hidden = []
+    #     step = self.batch_token_size
+    #     for s in range(0, len(prompts), step):
+    #         tok = self.tokenizer(prompts[s:s+step],
+    #                             return_tensors='pt',
+    #                             padding=True, truncation=True).to(self.device)
+    #         with torch.cuda.amp.autocast():
+    #             out = self.model(**tok).last_hidden_state  # [m, L, d]
+    #         all_hidden.append(out)
+    #     hidden = torch.cat(all_hidden, dim=0)  # [M, L, d]
+    #     L = hidden.shape[1]
+    #     d = hidden.shape[2]
+    #     T_max = L
+
+    #     # 3) (i,j)별로 재배치 & 패딩 → [B, T_max, d_model, N], 마지막 토큰 추출
+    #     prompt_token_emb = torch.zeros((B, T_max, d, N), device=hidden.device, dtype=hidden.dtype)
+    #     last_token_emb    = torch.zeros((B, d, N), device=hidden.device, dtype=hidden.dtype)
+
+    #     for k, (i, j) in enumerate(meta):
+    #         hij = hidden[k, :, :]  # [L, d]
+    #         # 길이 추정(여기선 L 그대로 사용; tokenizer padding으로 동일 L)
+    #         T_ij = L
+    #         if T_ij < T_max:
+    #             last = hij[-1:, :]
+    #             pad = last.repeat(T_max - T_ij, 1)
+    #             hij = torch.cat([hij, pad], dim=0)
+    #         prompt_token_emb[i, :, :, j] = hij
+    #         last_token_emb[i, :, j] = hij[-1, :]
+        
+    #     print(align_meta)
+
+    #     return last_token_emb, prompt_token_emb, align_meta
     # ==== [END REPLACE] ====

@@ -51,6 +51,7 @@ def parse_args():
     p.add_argument("--save", type=str, default="./logs/" + time.strftime("%Y-%m-%d-%H:%M:%S") + "-")
     # 정렬 관련
     p.add_argument("--align_weight", type=float, default=0.1, help="weight for cosine alignment loss")
+    p.add_argument("--align_weight_time", type=float, default=0.3, help = "weight for per-time alignment loss")
     p.add_argument("--common_dim", type=int, default=64, help="shared space dimension D")
     p.add_argument("--print_every", type=int, default=50)
     
@@ -145,11 +146,12 @@ def _norm_anchor(anc):
 
 def custom_collate(batch):
     """
-    batch item: (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg)
+    batch item: (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg, num_token_idx)
     x: [L, N], last_emb: [d_llm, N] (변형될 수 있으므로 정규화), full_prompt: [T_i, d_llm, N] or [K, T_i, d_llm, N]
     anchor_avg: [N, d_llm] or [K, N, d_llm]
+    - num_token_idx: 파이썬 리스트 (B 길이)로 유지 (각 요소는 [L][N] 구조의 리스트)
     """
-    xs, ys, xms, yms, lasts, fps, anchors = zip(*batch)
+    xs, ys, xms, yms, lasts, fps, anchors, tokidx = zip(*batch)
 
     x       = torch.stack([torch.as_tensor(t) for t in xs], dim=0)
     y       = torch.stack([torch.as_tensor(t) for t in ys], dim=0)
@@ -175,8 +177,11 @@ def custom_collate(batch):
         if t.shape != (N2, d2):
             raise ValueError(f"anchor_avg shapes differ inside batch: {tuple(t.shape)} vs {(N2, d2)}")
     anchor = torch.stack(anc_list, dim=0)  # [B, N, d_llm]
+    
+    # num_token_idx: list 그대로 (길이 B)
+    num_token_idx_batch = list(tokidx)
 
-    return x, y, x_mark, y_mark, last, full_prompt, anchor
+    return x, y, x_mark, y_mark, last, full_prompt, anchor, num_token_idx_batch
 
 def load_data(args):
     data_map = {
@@ -202,7 +207,7 @@ def get_first_batch_embeddings(loader, model, device):
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
-        x, _y, x_mark, _y_mark, last_emb, full_prompt_emb, _anchor = batch
+        x, _y, x_mark, _y_mark, last_emb, full_prompt_emb, _anchor_avg, _num_token_idx = batch
         x = x.to(device); x_mark = x_mark.to(device)
         
         last_emb = last_emb.to(device)
@@ -210,6 +215,61 @@ def get_first_batch_embeddings(loader, model, device):
         
         enc, pr, cr = model.get_embeddings(x, x_mark, last_emb, full_prompt_emb)
         return enc, pr, cr, full_prompt_emb 
+
+def time_step_alignment_loss(
+    ts_time_feats,           # [B, L, N, C]  시점을 보존한 TS 임베딩 (또는 value_embed(x) 등)
+    full_prompt,             # [B, T_max, d_llm, N]  프롬프트 전체 토큰 임베딩
+    num_token_idx,           # python list: num_token_idx[b][n][t] -> [idx, idx, ...]
+    ts_head,                 # TS -> D
+    txt_head,                # LLM -> D
+    *, detach_text=True, reduce="mean"
+):
+    """
+    시점 t에서 (b, n) 채널의 TS 임베딩 ↔ 해당 t의 숫자 토큰 평균 임베딩을 공통공간 D에서 코사인 정렬.
+    - 토큰 인덱스가 없는 시점은 스킵(마스크)합니다.
+    - detach_text=True면 프롬프트 임베딩은 고정(gradient 차단), txt_head만 업데이트.
+    """
+    device = ts_time_feats.device
+    B, L, N, C = ts_time_feats.shape
+    _, T_max, d_llm, N2 = full_prompt.shape
+    assert N == N2, f"Channel mismatch: N={N}, full_prompt N={N2}"
+    
+    # 공통 공간 매핑 준비
+    ts_time = ts_time_feats.reshape(B*L*N, C)              # [B*L*N, C]
+    ts_z    = ts_head(ts_time)                             # [B*L*N, D]
+    ts_z    = F.normalize(ts_z, dim=-1)
+    
+    losses = []
+    for b in range(B):
+        for n in range(N):
+            # full_prompt[b, :, :, n] : [T_max, d_llm]
+            fp_bn = full_prompt[b, :, :, n]                # [T_max, d_llm]
+            if detach_text:
+                fp_bn = fp_bn.detach()
+            for t in range(L):
+                tok_ids = num_token_idx[b][n][t] if t < len(num_token_idx[b][n]) else []
+                if not tok_ids:
+                    continue  # 토큰 없음 -> 스킵
+                # 숫자 토큰 평균 임베딩
+                valid = [idx for idx in tok_ids if 0 <= idx < T_max]
+                if not valid:
+                    continue
+                tok_vec = fp_bn[valid].mean(dim=0, keepdim=True)  # [1, d_llm]
+                txt_z   = txt_head(tok_vec)                       # [1, D]
+                txt_z   = F.normalize(txt_z, dim=-1)
+                
+                # 해당 (b,t,n)의 TS 임베딩 → 공통공간
+                flat_idx = (b*L*N) + (t*N) + n
+                z_ts = ts_z[flat_idx:flat_idx+1]                  # [1, D]
+                
+                # 코사인 정렬 손실
+                cos = F.cosine_similarity(z_ts, txt_z, dim=-1)    # [1]
+                losses.append(1.0 - cos)                          # [1]
+    
+    if len(losses) == 0:
+        return ts_time_feats.new_tensor(0.0)
+    losses = torch.cat(losses, dim=0)  # [M]
+    return losses.mean() if reduce == "mean" else losses.sum()
     
 # ----------------------------
 # Similarity / Heatmap helpers
@@ -430,39 +490,6 @@ def compute_pairwise_distance_mse(X: torch.Tensor, Y: torch.Tensor) -> float:
     # MSE between distance matrices
     return F.mse_loss(D1, D2).item()
 
-# def plot_pairwise_distance_heatmaps(X: torch.Tensor, Y: torch.Tensor, Z: torch.Tensor, save_path='pairwise_distance_heatmap.png'):
-#     """
-#     두 임베딩 X, Y의 pairwise distance matrix를 heatmap으로 시각화합니다.
-
-#     Args:
-#         X: [N, D1] torch.Tensor
-#         Y: [N, D2] torch.Tensor
-#     """
-    
-#     # 1. Pairwise distance 계산
-#     D1 = torch.cdist(X, X, p=2).cpu().detach().numpy()  # [N, N] - 모든 임베딩 간의 PAIRWISE 거리 계산
-#     D2 = torch.cdist(Y, Y, p=2).cpu().detach().numpy()  # [N, N]
-#     D3 = torch.cdist(Z, Z, p=2).cpu().detach().numpy()  # [N, N]
-
-#     D2 = D2[0]    # 첫번째 샘플
-#     D3 = D3[0]    # 첫번째 샘플
-
-#     # 2. 시각화
-#     fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-
-#     sns.heatmap(D1, ax=axs[0], cmap='viridis')
-#     axs[0].set_title("Prompt Token Embedding Distance")
-
-#     sns.heatmap(D2, ax=axs[1], cmap='viridis')
-#     axs[1].set_title("Prompt_last Embedding Distance")
-
-#     sns.heatmap(D3, ax=axs[2], cmap='viridis')
-#     axs[2].set_title("Cross Embedding Distance")
-
-#     plt.tight_layout()
-#     plt.savefig(save_path, dpi=150)
-#     print(f"✅ Saved heatmap to {save_path}")
-
 def plot_pairwise_distance_heatmaps(
     X: torch.Tensor,
     Y: torch.Tensor,
@@ -637,7 +664,7 @@ def main():
     pd_mse_pre_common_full = compute_pairwise_distance_mse(
         cross_z_pre.detach().cpu(), txt_full_z_pre.detach().cpu()
     )
-    print(f"[Common] Post-training Pairwise Distance MSE (TS vs FULL-PROMPT): {pd_mse_pre_common_full:.6f}")
+    print(f"[Common] Pre-training Pairwise Distance MSE (TS vs FULL-PROMPT): {pd_mse_pre_common_full:.6f}")
 
     # 공통 공간에서 히트맵
     plot_pairwise_distance_heatmaps(
@@ -669,65 +696,63 @@ def main():
     for epoch in range(1, args.epochs + 1):
         t1 = time.time()
         engine.model.train()
-        tr_pred, tr_align, tr_total, tr_mae = [], [], [], []
+        tr_pred, tr_align_channel, tr_align_time, tr_total, tr_mae = [], [], [], [], []
 
         train_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch} [Train]", ncols=120)
-        for iter, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg) in train_bar:
+        for iter, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg, num_token_idx_batch) in train_bar:
             x, y = x.to(device), y.to(device)
             x_mark = x_mark.to(device)
             last_emb = last_emb.to(device)
-            full_prompt = full_prompt.to(device) if iter == 0 else None
+            full_prompt = full_prompt.to(device) 
             anchor_avg = anchor_avg.to(device)  # [B, N, d_llm]
+            # num_token_idx_batch = num_token_idx_batch.to(device)
 
             engine.optimizer.zero_grad(set_to_none=True)
 
-            # 예측 손실
+            # 1) 예측 손실
             pred = engine.model(x, x_mark, last_emb, full_prompt)
             loss_pred = engine.loss(pred, y)
 
-            # 정렬 손실: cross vs anchor_avg
-            # === get cross embeddings ===
+            # 2) 채널 정렬
             with torch.no_grad():
-                _, _, cr = engine.model.get_embeddings(x, x_mark, last_emb, None)  # 기대: [B, N, C]
-
-            # cr 정규화: [B, N, C] 보장
-            if cr.dim() != 3:
-                raise ValueError(f"cr must be 3D [B,N,C], got {tuple(cr.shape)}")
+                _, _, cr = engine.model.get_embeddings(x, x_mark, last_emb, None)  # [B,N,C] 보장되도록 코드 유지
             # 만약 [B, C, N]로 온 경우 뒤집기
             if cr.shape[1] == args.channel and cr.shape[2] == args.num_nodes:
-                cr = cr.permute(0, 2, 1).contiguous()  # [B, N, C]
-
+                cr = cr.permute(0,2,1).contiguous()  # [B,N,C]
             # === anchor 정규화: [B, N, d_llm] 보장 ===
-            anc = anchor_avg  # 원본
+            anc = anchor_avg
             if anc.dim() == 4:
                 # 보통 [B, K, N, d_llm] 형태인 경우 → K 평균 풀링
-                anc = anc.mean(dim=1)  # [B, N, d_llm]
-            elif anc.dim() == 3:
-                # [B, d_llm, N] 로 오는 경우 → [B, N, d_llm] 로 변환
-                if anc.shape[1] == args.d_llm and anc.shape[2] == args.num_nodes:
-                    anc = anc.permute(0, 2, 1).contiguous()
-                # 이미 [B, N, d_llm] 이면 그대로 사용
-            else:
-                raise ValueError(f"anchor_avg bad shape: {tuple(anc.shape)} (need [B,N,d_llm] or [B,K,N,d_llm] or [B,d_llm,N])")
+                anc = anc.mean(dim=1)   # [B, N, d_llm]
+            # [B, d_llm, N] 로 오는 경우 → [B, N, d_llm] 로 변환
+            elif anc.dim() == 3 and anc.shape[1] == args.d_llm and anc.shape[2] == args.num_nodes:
+                anc = anc.permute(0,2,1).contiguous()  # [B,N,d_llm]
 
             # 디버그 프린트(한 번만 보고 싶으면 if it==0 같은 조건 걸기)
             if iter == 0:
                 print(f"[debug] cr shape={tuple(cr.shape)}, anchor_avg(norm) shape={tuple(anc.shape)}")
 
-            # --- 공통공간 매핑 ---
-            ts_z  = engine.ts_head(cr)     # [B, N, D]
-            txt_z = engine.txt_head(anc)   # [B, N, D]
+            # --- 공통공간 매핑 & 코사인 정렬 손실 ---
+            ts_z_ch  = F.normalize(engine.ts_head(cr),  dim=-1)     # [B,N,D] -> [B,N]
+            txt_z_ch = F.normalize(engine.txt_head(anc), dim=-1)    # [B,N,D]
+            loss_align_channel= (1.0 - F.cosine_similarity(ts_z_ch, txt_z_ch, dim=-1)).mean()
 
-            # --- 코사인 정렬 손실 ---
-            ts_z  = F.normalize(ts_z,  dim=-1)
-            txt_z = F.normalize(txt_z, dim=-1)
-            cos_sim = F.cosine_similarity(ts_z, txt_z, dim=-1)  # [B, N]
-            loss_align = (1.0 - cos_sim).mean()
-            cos_sim = F.cosine_similarity(ts_z, txt_z, dim=-1)    # [B,N]
-            loss_align = (1.0 - cos_sim).mean()
+            # 3) 시점 정렬 (TS 시점 임베딩 ↔ 해당 시점의 숫자 토큰 평균)
+            enc_time = engine.model.get_time_embeddings(x)  # [B,L,N,C] (모델에 구현된 경로)
+            #    - TimeCMA에서 시점 임베딩 얻기
+            loss_align_time = time_step_alignment_loss(
+                ts_time_feats = enc_time,                # [B,L,N,C]  (모델에서 뽑아온 시점임베딩 or value_embed 경로)
+                full_prompt   = full_prompt,             # [B,T_max,d_llm,N]
+                num_token_idx = num_token_idx_batch,     # list[b][n][t] -> [token ids]
+                ts_head       = engine.ts_head,
+                txt_head      = engine.txt_head,
+                detach_text   = True,
+            )
 
-            loss = loss_pred + args.align_weight * loss_align
+            # 4) 총 손실
+            loss = loss_pred + (args.align_weight * loss_align_channel) + (args.align_weight_time * loss_align_time)
             loss.backward()
+            
             if engine.clip is not None:
                 torch.nn.utils.clip_grad_norm_(
                     list(engine.model.parameters()) + list(engine.ts_head.parameters()) + list(engine.txt_head.parameters()),
@@ -736,84 +761,94 @@ def main():
             engine.optimizer.step()
 
             tr_pred.append(loss_pred.item())
-            tr_align.append(loss_align.item())
+            tr_align_channel.append(loss_align_channel.item())
+            tr_align_time.append(loss_align_time.item())
             tr_total.append(loss.item())
             tr_mae.append(engine.MAE(pred, y).item())
             
             if iter % args.print_every == 0:
-                print(f"[Train][Ep {epoch:03d}][It {iter:05d}] pred={tr_pred[-1]:.6f} align={tr_align[-1]:.6f} total={tr_total[-1]:.6f}")
+                print(f"[Train][Ep {epoch:03d}][It {iter:05d}] pred={tr_pred[-1]:.6f} align_chan={tr_align_channel[-1]:.6f} align_time={tr_align_time[-1]:.6f} total={tr_total[-1]:.6f}")
 
         t2 = time.time(); train_time.append(t2 - t1)
         print(f"Epoch {epoch:03d} Training Time: {t2 - t1:.2f}s")
 
         # ===== Validation =====
         engine.model.eval()
-        va_pred, va_align, va_total, va_mae = [], [], [], []
+        va_pred, va_align_channel, va_align_time, va_total, va_mae = [], [], [], [], []
         s1 = time.time()
         with torch.no_grad():
             valid_bar = tqdm(enumerate(val_loader), total=len(val_loader), desc=f"Epoch {epoch} [Val]", ncols=120)
-            for it, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg) in valid_bar:
+            for it, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg, num_token_idx_batch) in valid_bar:
                 x = x.to(device); y = y.to(device)
                 x_mark = x_mark.to(device)
                 last_emb = last_emb.to(device)
-                full_prompt = full_prompt.to(device) if it == 0 else None
+                full_prompt = full_prompt.to(device)
                 anchor_avg = anchor_avg.to(device)
 
+                # 1) 예측 손실
                 pred = engine.model(x, x_mark, last_emb, full_prompt)
                 loss_pred = engine.loss(pred, y)
-                
-                _, _, cr = engine.model.get_embeddings(x, x_mark, last_emb, None)  # 기대: [B, N, C]
 
-                # cr 정규화: [B, N, C] 보장
-                if cr.dim() != 3:
-                    raise ValueError(f"cr must be 3D [B,N,C], got {tuple(cr.shape)}")
+                # 2) 채널 정렬
+                with torch.no_grad():
+                    _, _, cr = engine.model.get_embeddings(x, x_mark, last_emb, None)  # [B,N,C] 보장되도록 코드 유지
                 # 만약 [B, C, N]로 온 경우 뒤집기
                 if cr.shape[1] == args.channel and cr.shape[2] == args.num_nodes:
-                    cr = cr.permute(0, 2, 1).contiguous()  # [B, N, C]
-
+                    cr = cr.permute(0,2,1).contiguous()  # [B,N,C]
                 # === anchor 정규화: [B, N, d_llm] 보장 ===
-                anc = anchor_avg  # 원본
+                anc = anchor_avg
                 if anc.dim() == 4:
                     # 보통 [B, K, N, d_llm] 형태인 경우 → K 평균 풀링
-                    anc = anc.mean(dim=1)  # [B, N, d_llm]
-                elif anc.dim() == 3:
-                    # [B, d_llm, N] 로 오는 경우 → [B, N, d_llm] 로 변환
-                    if anc.shape[1] == args.d_llm and anc.shape[2] == args.num_nodes:
-                        anc = anc.permute(0, 2, 1).contiguous()
-                    # 이미 [B, N, d_llm] 이면 그대로 사용
-                else:
-                    raise ValueError(f"anchor_avg bad shape: {tuple(anc.shape)} (need [B,N,d_llm] or [B,K,N,d_llm] or [B,d_llm,N])")
+                    anc = anc.mean(dim=1)   # [B, N, d_llm]
+                # [B, d_llm, N] 로 오는 경우 → [B, N, d_llm] 로 변환
+                elif anc.dim() == 3 and anc.shape[1] == args.d_llm and anc.shape[2] == args.num_nodes:
+                    anc = anc.permute(0,2,1).contiguous()  # [B,N,d_llm]
 
                 # 디버그 프린트(한 번만 보고 싶으면 if it==0 같은 조건 걸기)
                 if iter == 0:
                     print(f"[debug] cr shape={tuple(cr.shape)}, anchor_avg(norm) shape={tuple(anc.shape)}")
-                # print("cr.shape : ", cr.shape)
-                # print("anc.shape : ", anc.shape)
-                
-                ts_z  = engine.ts_head(cr)
-                txt_z = engine.txt_head(anc)  # 고정값
 
-                ts_z  = F.normalize(ts_z,  dim=-1)
-                txt_z = F.normalize(txt_z, dim=-1)
-                loss_align = (1.0 - F.cosine_similarity(ts_z, txt_z, dim=-1)).mean()
+                # --- 공통공간 매핑 & 코사인 정렬 손실 ---
+                ts_z_chan  = F.normalize(engine.ts_head(cr),  dim=-1)     # [B,N,D] -> [B,N]
+                txt_z_chan = F.normalize(engine.txt_head(anc), dim=-1)    # [B,N,D]
+                loss_align_channel = (1.0 - F.cosine_similarity(ts_z_chan, txt_z_chan, dim=-1)).mean()
 
-                loss = loss_pred + args.align_weight * loss_align
+                # 3) 시점 정렬
+                enc_time = engine.model.get_time_embeddings(x)  # [B,L,N,C]
+                loss_align_time = time_step_alignment_loss(
+                    ts_time_feats = enc_time,
+                    full_prompt   = full_prompt,
+                    num_token_idx = num_token_idx_batch,
+                    ts_head       = engine.ts_head,
+                    txt_head      = engine.txt_head,
+                    detach_text   = True
+                )
+
+                # 4) 총 손실
+                loss = loss_pred + (args.align_weight * loss_align_channel) + (args.align_weight_time * loss_align_time)
 
                 va_pred.append(loss_pred.item())
-                va_align.append(loss_align.item())
+                va_align_channel.append(loss_align_channel.item())
+                va_align_time.append(loss_align_time.item())
                 va_total.append(loss.item())
                 va_mae.append(engine.MAE(pred, y).item())
 
                 if it % args.print_every == 0:
-                    print(f"[Valid][Ep {epoch:03d}][It {it:05d}] pred={loss_pred.item():.6f} align={loss_align.item():.6f} total={loss.item():.6f}")
+                    print(f"[Valid][Ep {epoch:03d}][It {it:05d}] pred={loss_pred.item():.6f} align_chan={loss_align_channel.item():.6f} align_time={loss_align_time.item():.6f} total={loss.item():.6f}")
 
         s2 = time.time(); val_time.append(s2 - s1)
-        mtrain_pred, mtrain_align, mtrain_total, mtrain_mae = map(float, (np.mean(tr_pred), np.mean(tr_align), np.mean(tr_total), np.mean(tr_mae)))
-        mvalid_pred, mvalid_align, mvalid_total, mvalid_mae = map(float, (np.mean(va_pred), np.mean(va_align), np.mean(va_total), np.mean(va_mae)))
+        mtrain_pred, mtrain_align_channel, mtrain_align_time, mtrain_total, mtrain_mae = map(
+            float,
+            [np.mean(tr_pred), np.mean(tr_align_channel), np.mean(tr_align_time), np.mean(tr_total), np.mean(tr_mae)]
+        )
+        mvalid_pred, mvalid_align_channel, mvalid_align_time, mvalid_total, mvalid_mae = map(
+            float,
+            [np.mean(va_pred), np.mean(va_align_channel), np.mean(va_align_time), np.mean(va_total), np.mean(va_mae)]
+        )
 
         print("-----------------------")
-        print(f"[Epoch {epoch:03d}] Train: pred={mtrain_pred:.6f} align={mtrain_align:.6f} total={mtrain_total:.6f} MAE={mtrain_mae:.6f}")
-        print(f"[Epoch {epoch:03d}] Valid: pred={mvalid_pred:.6f} align={mvalid_align:.6f} total={mvalid_total:.6f} MAE={mvalid_mae:.6f}")
+        print(f"[Epoch {epoch:03d}] Train: pred={mtrain_pred:.6f} align_chan={mtrain_align_channel:.6f} align_time={mtrain_align_time:.6f} total={mtrain_total:.6f} MAE={mtrain_mae:.6f}")
+        print(f"[Epoch {epoch:03d}] Valid: pred={mvalid_pred:.6f} align_chan={mvalid_align_channel:.6f} align_time={mvalid_align_time:.6f} total={mvalid_total:.6f} MAE={mvalid_mae:.6f}")
         print("-----------------------")
 
         his_loss.append(mvalid_total)
@@ -883,6 +918,35 @@ def main():
     # (선택) 분포 비교도 공통 공간으로
     plot_similarity_distributions(cos_pre_common, cos_post_common, save_path="sim_distribution_common.png")
 
+    # # ---------- Test ----------
+    # ckpt = torch.load(os.path.join(path, "best_model.pth"), map_location=device)
+    # engine.model.load_state_dict(ckpt["model"])
+    # engine.ts_head.load_state_dict(ckpt["ts_head"])
+    # engine.txt_head.load_state_dict(ckpt["txt_head"])
+
+    # test_outs, test_ys = [], []
+    # engine.model.eval()
+    # with torch.no_grad():
+    #     for it, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg, _num_token_idx) in enumerate(test_loader):
+    #         x = x.to(device); y = y.to(device)
+    #         x_mark = x_mark.to(device)
+    #         last_emb = last_emb.to(device)
+    #         full_prompt = full_prompt.to(device)  # 리소스 부족하면 None도 가능
+    #         preds = engine.model(x, x_mark, last_emb, full_prompt)
+    #         test_outs.append(preds); test_ys.append(y)
+
+    # test_pre = torch.cat(test_outs, 0)
+    # test_real = torch.cat(test_ys, 0)
+
+    # amse, amae = [], []
+    # for j in range(args.pred_len):
+    #     pred = test_pre[:, j,].to(device)
+    #     real = test_real[:, j, ].to(device)
+    #     m = metric(pred, real)
+    #     amse.append(m[0]); amae.append(m[1])
+
+    # print(f"On average horizons, Test MSE: {np.mean(amse):.4f}, Test MAE: {np.mean(amae):.4f}")
+    # print(f"Best epoch: {bestid}, Best valid(total loss): {best_val:.6f}")
     # ---------- Test ----------
     ckpt = torch.load(os.path.join(path, "best_model.pth"), map_location=device)
     engine.model.load_state_dict(ckpt["model"])
@@ -890,16 +954,64 @@ def main():
     engine.txt_head.load_state_dict(ckpt["txt_head"])
 
     test_outs, test_ys = [], []
+    test_align_chan, test_align_time = [], []
+
     engine.model.eval()
     with torch.no_grad():
-        for it, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg) in enumerate(test_loader):
+        for it, (x, y, x_mark, y_mark, last_emb, full_prompt, anchor_avg, num_token_idx_batch) in enumerate(test_loader):
             x = x.to(device); y = y.to(device)
             x_mark = x_mark.to(device)
             last_emb = last_emb.to(device)
-            full_prompt = full_prompt.to(device)  # 리소스 부족하면 None도 가능
+            full_prompt = full_prompt.to(device)            # [B, T_max, d_llm, N]
+            # anchor_avg: [B, N, d_llm]  혹은 [B, d_llm, N]
+            anchor_avg = anchor_avg.to(device)
+
+            # 1) 예측
             preds = engine.model(x, x_mark, last_emb, full_prompt)
             test_outs.append(preds); test_ys.append(y)
 
+            # 2) 채널 정렬 측정
+            #    - cross 임베딩 추출
+            _, _, cr = engine.model.get_embeddings(x, x_mark, last_emb, None)  # 기대: [B,N,C] 또는 [B,C,N]
+            if cr.dim() != 3:
+                raise ValueError(f"cr must be 3D, got {tuple(cr.shape)}")
+            # [B, C, N]으로 왔다면 [B, N, C]로 변경
+            if cr.shape[1] == args.channel and cr.shape[2] == args.num_nodes:
+                cr = cr.permute(0, 2, 1).contiguous()  # [B, N, C]
+
+            # anchor 정규화: [B, N, d_llm]
+            anc = anchor_avg
+            if anc.dim() == 3 and anc.shape[1] == args.d_llm and anc.shape[2] == args.num_nodes:
+                anc = anc.permute(0, 2, 1).contiguous()  # [B, N, d_llm]
+            elif anc.dim() == 4:
+                anc = anc.mean(dim=1)  # [B, N, d_llm]
+            # 공통공간 투영 & 코사인 손실
+            ts_z  = F.normalize(engine.ts_head(cr),  dim=-1)   # [B, N, D]
+            txt_z = F.normalize(engine.txt_head(anc), dim=-1)  # [B, N, D]
+            loss_align_chan = (1.0 - F.cosine_similarity(ts_z, txt_z, dim=-1)).mean()
+            test_align_chan.append(loss_align_chan.item())
+
+            # 3) 시점 정렬 측정 (있을 때만)
+            if hasattr(engine.model, "get_time_embeddings"):
+                # 시점 임베딩: [B, L, N, C] (모델 구현에 맞춰 반환)
+                enc_time = engine.model.get_time_embeddings(x)
+
+                # 주의: num_token_idx_batch는 리스트(가변 길이)일 가능성이 높음 → 텐서로 .to(device) 하지 말 것
+                # time_step_alignment_loss(ts_time_feats, full_prompt, num_token_idx, ts_head, txt_head, detach_text=True)
+                loss_align_time = time_step_alignment_loss(
+                    ts_time_feats = enc_time, 
+                    full_prompt   = full_prompt, 
+                    num_token_idx = num_token_idx_batch, 
+                    ts_head       = engine.ts_head, 
+                    txt_head      = engine.txt_head, 
+                    detach_text   = True
+                )
+                test_align_time.append(float(loss_align_time))
+            else:
+                # 모델에 시점 임베딩 함수가 없다면 타임 정렬은 생략
+                pass
+
+    # 회귀 지표
     test_pre = torch.cat(test_outs, 0)
     test_real = torch.cat(test_ys, 0)
 
@@ -911,6 +1023,12 @@ def main():
         amse.append(m[0]); amae.append(m[1])
 
     print(f"On average horizons, Test MSE: {np.mean(amse):.4f}, Test MAE: {np.mean(amae):.4f}")
+    # 정렬 지표 집계/출력
+    if len(test_align_chan) > 0:
+        print(f"Test Align(Channel) avg loss: {np.mean(test_align_chan):.6f}")
+    if len(test_align_time) > 0:
+        print(f"Test Align(Time)    avg loss: {np.mean(test_align_time):.6f}")
+
     print(f"Best epoch: {bestid}, Best valid(total loss): {best_val:.6f}")
     
 if __name__ == "__main__":

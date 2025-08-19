@@ -49,11 +49,29 @@ class Dual(nn.Module):
         self.normalize_layers = Normalize(self.num_nodes, affine=False).to(self.device)
         self.length_to_feature = nn.Linear(self.seq_len, self.channel).to(self.device)
 
-        # Time Series Encoder
+        # === (A) Dual.__init__ 안에 추가 ===
+        self.value_embed = nn.Sequential(
+            nn.Linear(1, 32), nn.GELU(),
+            nn.Linear(32, 64), nn.GELU(),
+            nn.Linear(64, self.channel),
+            nn.LayerNorm(self.channel)
+        ).to(self.device)
+        
+        # Time Series Encoder (채널 축 정렬)
         self.ts_encoder_layer = nn.TransformerEncoderLayer(d_model = self.channel, nhead = self.head, batch_first=True, 
                                                            norm_first = True,dropout = self.dropout_n).to(self.device)
         self.ts_encoder = nn.TransformerEncoder(self.ts_encoder_layer, num_layers = self.e_layer).to(self.device)
-
+        
+        # --- 시간축(시점별) 인코더 경로 ---
+        # L차원을 유지하는 얕은 temporal encoder (표현력 ↑ 원하면 num_layers 올리면 됨)
+        self.nodes_to_feature = nn.Linear(self.num_nodes, self.channel).to(self.device) # [B,L,N] -> [B,L,C]
+        self.temp_layer = nn.TransformerEncoderLayer(
+            d_model=self.channel, nhead=self.head, batch_first=True, norm_first=True, dropout=self.dropout_n
+        ).to(self.device)
+        self.temp_encoder = nn.TransformerEncoder(self.temp_layer, num_layers=self.e_layer).to(self.device)
+        # enc_time 캐시 (forward 후 학습 루프에서 사용)
+        self._enc_time_cache = None
+        
         # Prompt Encoder
         self.prompt_encoder_layer = nn.TransformerEncoderLayer(d_model = self.d_llm, nhead = self.head, batch_first=True, 
                                                                norm_first = True,dropout = self.dropout_n).to(self.device)
@@ -122,9 +140,23 @@ class Dual(nn.Module):
         # print(f"[DEBUG] after length_to_feature: {x_tokens.shape}")  # [B, N, C], 여기서 C=32 기대
 
         # Transformer Encoder
-        enc_out = self.ts_encoder(x_tokens)          # [B, N, C]
-        enc_out = enc_out.permute(0, 2, 1).contiguous()  # [B, C, N]
+        # --- channel embedding path(기존) ---
+        enc_out_channel = self.ts_encoder(x_tokens)          # [B, N, C]
+        enc_out = enc_out_channel.permute(0, 2, 1).contiguous()  # [B, C, N]
 
+        # === NEW: 시점 경로 ===
+        # input_data: [B, L, N]
+        v = input_data.unsqueeze(-1)                  # [B, L, N, 1]
+        v = self.value_embed(v)                       # [B, L, N, C]
+        v = v.permute(0, 2, 1, 3).contiguous()        # [B, N, L, C]
+        B, N, L, C = v.shape
+        v_flat = v.view(B * N, L, C)                  # [B*N, L, C]
+        enc_time_flat = self.temp_encoder(v_flat) # [B*N, L, C]
+        enc_time = enc_time_flat.view(B, N, L, C)     # [B, N, L, C]
+
+        # 캐시에 저장: 학습 루프가 바로 사용
+        self._enc_time_cache = enc_time
+        
         # --- 이하 last_emb, prompt_encoded, cross_out 처리 ---
         print("last_emb.shape: ", last_emb.shape)
         if last_emb.is_sparse:
@@ -209,8 +241,21 @@ class Dual(nn.Module):
         # print(f"[DEBUG] after length_to_feature: {x_tokens.shape}")  # [B, N, C], 여기서 C=32 기대
 
         # Transformer Encoder
-        enc_out = self.ts_encoder(x_tokens)          # [B, N, C]
-        enc_out = enc_out.permute(0, 2, 1).contiguous()  # [B, C, N]
+        enc_out_channel = self.ts_encoder(x_tokens)          # [B, N, C]
+        enc_out = enc_out_channel.permute(0, 2, 1).contiguous()  # [B, C, N]
+
+        # 시점 임베딩 분기
+        # === NEW: 시점 경로 동일 생성 ===
+        v = input_data.unsqueeze(-1)                  # [B, L, N, 1]
+        v = self.value_embed(v)                       # [B, L, N, C]
+        v = v.permute(0, 2, 1, 3).contiguous()        # [B, N, L, C]
+        B, N, L, C = v.shape
+        v_flat = v.view(B * N, L, C)                  # [B*N, L, C]
+        enc_time_flat = self.temp_encoder(v_flat) # [B*N, L, C]
+        enc_time = enc_time_flat.view(B, N, L, C)     # [B, N, L, C]
+
+        # 캐시 업데이트
+        self._enc_time_cache = enc_time
 
         # --- 이하 last_emb, prompt_encoded, cross_out 처리 ---
         if last_emb.is_sparse:
@@ -230,6 +275,29 @@ class Dual(nn.Module):
         cross_out = cross_out.permute(0, 2, 1)  # [B, N, C]                 # [B, N, C]
 
         return enc_out.detach(), prompt_encoded.detach(), cross_out.detach()
+    
+    # === (B) Dual 클래스 안에 메서드 추가 ===
+    @torch.no_grad()  # 시점 정렬만 뽑을 때는 고정도 가능(원하면 제거해서 joint로 학습 가능)
+    def get_time_embeddings(self, input_data: torch.Tensor) -> torch.Tensor:
+        """
+        입력:  input_data [B, L, N]
+        반환:  ts_time [B, L, N, C]  (시점별 임베딩)
+        """
+        x = input_data.float()
+        # RevIN normalize (학습과 동일)
+        x = self.normalize_layers(x, 'norm')              # [B, L, N]
+
+        B, L, N = x.shape
+        # 값(스칼라) -> 채널차원 C : [B,L,N,1] -> [B,L,N,C]
+        xv = x.unsqueeze(-1)
+        xv = self.value_embed(xv)                         # [B,L,N,C]
+
+        # temporal encoder: L 차원 문맥 반영
+        # [B,L,N,C] -> [B,N,L,C] -> (B*N, L, C)
+        tmp = xv.permute(0, 2, 1, 3).reshape(B * N, L, self.channel)
+        tmp = self.temp_encoder(tmp)                      # [B*N, L, C]
+        ts_time = tmp.reshape(B, N, L, self.channel).permute(0, 2, 1, 3).contiguous()  # [B,L,N,C]
+        return ts_time
     
     def compute_alignment_loss(
         self,
