@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and Results
+logs/
+Results/
+*.log
+
+# Data and Embeddings
+MY/Embeddings/
+dataset/*.csv
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# Images (optional - uncomment if you don't want to track images)
+*.png
+*.jpg
+*.jpeg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
