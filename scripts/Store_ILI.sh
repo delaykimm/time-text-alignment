@@ -6,6 +6,7 @@ divides=("train" "val" "test")
 num_nodes=7
 input_len=36
 output_len=24
+device="cuda"  # device 변수 추가
 
 for data_path in "${data_paths[@]}"; do
   for divide in "${divides[@]}"; do

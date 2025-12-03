@@ -13,7 +13,7 @@ class GenPromptEmb(nn.Module):
         input_len = 96,
         d_model = 768,
         layer = 12,
-        divide = 'train'
+        divide = 'train',
     ):  
         super(GenPromptEmb, self).__init__()
         self.data_path = data_path
@@ -23,6 +23,7 @@ class GenPromptEmb(nn.Module):
         self.d_model = d_model
         self.layer = layer
         self.len = self.input_len-1
+        self._num2words_cache = {}
         
         # # fast tokenizer & model (so offset_mapping works)
         # self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -58,28 +59,35 @@ class GenPromptEmb(nn.Module):
         # 배치 토큰 처리 크기(메모리에 맞게 조절)
         self.batch_token_size = 64
         # ==== [END REPLACE] ====
-
         
     def float_to_words(self, x: float) -> str:
+        # 캐시 먼저 확인
+        if x in self._num2words_cache:
+            return self._num2words_cache[x]
+
         s = str(x)
         if '.' not in s:
             try:
-                return num2words(int(x)).replace('-', ' ')
+                txt = num2words(int(x)).replace('-', ' ')
             except:
-                return str(x)
-        integer_part, decimal_part = s.split('.')
-        parts = []
-        try:
-            parts.append(num2words(int(integer_part)).replace('-', ' '))
-        except:
-            parts.append(str(integer_part))
-        parts.append('point')
-        for d in decimal_part:
+                txt = str(x)
+        else:
+            integer_part, decimal_part = s.split('.')
+            parts = []
             try:
-                parts.append(num2words(int(d)).replace('-', ' '))
+                parts.append(num2words(int(integer_part)).replace('-', ' '))
             except:
-                parts.append(d)
-        return ' '.join(parts)
+                parts.append(str(integer_part))
+            parts.append('point')
+            for d in decimal_part:
+                try:
+                    parts.append(num2words(int(d)).replace('-', ' '))
+                except:
+                    parts.append(d)
+            txt = ' '.join(parts)
+
+        self._num2words_cache[x] = txt
+        return txt
     
     def _prepare_prompt(self, input_template, in_data, in_data_mark, i, j):
         # 원래 값들 가져오고 소수점 둘째 자리까지 반올림
@@ -118,26 +126,23 @@ class GenPromptEmb(nn.Module):
         # )
         # model_input = {k: v.to(self.device) for k, v in tokenized.items() if k != "offset_mapping"}
 
-        # Collect value-index pairs using enhanced matching
-        value_index_pairs = []
-        for v in values:
-            phrase_text = self.float_to_words(v)
-            indices = get_prompt_indices(in_prompt, self.tokenizer, float(v), phrase_text=phrase_text)
-            if not indices:
-                # 디버그 필요할 때 주석 해제
-                # debug_get_prompt_indices(in_prompt, self.tokenizer, float(v))
-                pass
-            if len(indices) > 0:
-                value_index_pairs.append((float(v), indices))
+        # ---- 여기서부터: 숫자별 "문자 스팬"만 계산 ----
+        # numeric_spans: [(value_float, [(char_start, char_end), ...]), ...]
+        numeric_spans = []
+        for v, text_v in zip(values, text_values):
+            spans_for_this_value = []
+            search_start = 0
+            while True:
+                idx = in_prompt.find(text_v, search_start)
+                if idx == -1:
+                    break
+                spans_for_this_value.append((idx, idx + len(text_v)))
+                search_start = idx + len(text_v)
+            numeric_spans.append((float(v), spans_for_this_value))
 
-        if not value_index_pairs:
-            # fallback: 마지막 값과 마지막 토큰
-            value_index_pairs.append((float(values[-1]), [-1]))
-            
-        #print(value_index_pairs)
-        #print(in_prompt)
-
-        return in_prompt, value_index_pairs  # list of (value, [token positions])
+        # 일단 여기서는 "문자 스팬"까지만 반환
+        # (토큰 인덱스로의 매핑은 generate_embeddings에서 한 번에 처리)
+        return in_prompt, numeric_spans
 
     def forward(self, tokenized_prompt_dict):
         # tokenized_prompt_dict: output from tokenizer (input_ids, attention_mask, etc.)
@@ -213,9 +218,9 @@ class GenPromptEmb(nn.Module):
     def generate_embeddings(self, in_data, in_data_mark):
         """
         반환:
-        last_token_emb: [B, d_model, N]
+        last_token_emb:   [B, d_model, N]
         prompt_token_emb: [B, T_max, d_model, N]
-        align_meta:  align_meta[b][n] = [(value_t, [tok_idx...]), ...]
+        align_meta[b][n] = [(value_t, [tok_idx...]), ...]
         """
         input_templates = {
             'FRED':  "From [t1] to [t2], the values were value1, ..., valuen every month. The total trend value was Trends",
@@ -232,65 +237,142 @@ class GenPromptEmb(nn.Module):
         B = in_data.shape[0]
         N = in_data.shape[2]
 
-        # 1) (i,j)별 프롬프트 문자열 + 메타 생성
-        prompts, meta = [], []
-        align_meta = [[None for _ in range(N)] for _ in range(B)]
-        for i in range(B):
-            for j in range(N):
-                prompt_str, value_index_pairs = self._prepare_prompt(template, in_data, in_data_mark, i, j)
+        # 1) (i,j)별 프롬프트 + "문자 스팬 기반 numeric_spans" 생성
+        prompts = []
+        meta    = []   # (b, n)
+        numeric_spans_list = []  # 각 prompt에 대한 numeric_spans
 
-                # 혹시 실수로 list/tuple을 반환하면 문자열로 합침 (안전망)
+        for b in range(B):
+            for n in range(N):
+                prompt_str, numeric_spans = self._prepare_prompt(
+                    template, in_data, in_data_mark, b, n
+                )
+
                 if isinstance(prompt_str, (list, tuple)):
                     prompt_str = "\n".join(map(str, prompt_str))
                 elif not isinstance(prompt_str, str):
                     prompt_str = str(prompt_str)
 
                 prompts.append(prompt_str)
-                meta.append((i, j))
-                align_meta[i][j] = value_index_pairs
+                meta.append((b, n))
+                numeric_spans_list.append(numeric_spans)
 
-        # 2) 배치 토크나이즈 → 모델 forward (chunk 단위)
+        # 2) batched tokenizer + GPT2 forward (chunk 단위)
         all_hidden = []
-        all_attn = []
+        all_attn   = []
+        all_offsets = []
+
         step = getattr(self, "batch_token_size", 64)
 
         for s in range(0, len(prompts), step):
+            batch_prompts = prompts[s:s+step]
             tok = self.tokenizer(
-                prompts[s:s+step],
+                batch_prompts,
                 return_tensors='pt',
                 padding=True,
-                truncation=True
+                truncation=True,
+                return_offsets_mapping=True,
             ).to(self.device)
 
+            offsets = tok["offset_mapping"].detach().cpu()  # [m, L, 2]  (문자 인덱스)
+
             with torch.cuda.amp.autocast():
-                out = self.model(**tok).last_hidden_state  # [m, L, d]
+                out = self.model(**{k: v for k, v in tok.items() if k != "offset_mapping"})
+            hidden = out.last_hidden_state          # [m, L, d]
 
-            all_hidden.append(out)
-            all_attn.append(tok["attention_mask"])        # [m, L]
+            all_hidden.append(hidden)
+            all_attn.append(tok["attention_mask"])
+            all_offsets.append(offsets)
 
-        hidden = torch.cat(all_hidden, dim=0)  # [M, L, d]
-        attn   = torch.cat(all_attn,   dim=0)  # [M, L]
+        hidden  = torch.cat(all_hidden,  dim=0)  # [M, L, d]
+        attn    = torch.cat(all_attn,    dim=0)  # [M, L]
+        offsets = torch.cat(all_offsets, dim=0)  # [M, L, 2] (CPU 텐서)
 
-        # 유효 토큰 길이(패딩 제외)와 T_max
+        # 유효 토큰 길이 (패딩 제외)
         lengths = attn.sum(dim=1)  # [M]
-        T_max = int(lengths.max().item())
-        d = hidden.shape[2]
+        T_max   = int(lengths.max().item())
+        d       = hidden.shape[2]
+        M       = hidden.shape[0]
 
-        # 3) (i,j)별로 재배치 & 패딩 → [B, T_max, d_model, N], 마지막 유효 토큰 추출
-        prompt_token_emb = torch.zeros((B, T_max, d, N), device=hidden.device, dtype=hidden.dtype)
-        last_token_emb   = torch.zeros((B, d, N),         device=hidden.device, dtype=hidden.dtype)
+        # 3) [B, T_max, d, N] 및 last_token_emb 구성
+        prompt_token_emb = torch.zeros((B, T_max, d, N),
+                                    device=hidden.device,
+                                    dtype=hidden.dtype)
+        last_token_emb   = torch.zeros((B, d, N),
+                                    device=hidden.device,
+                                    dtype=hidden.dtype)
 
-        for k, (i, j) in enumerate(meta):
-            L_k = int(lengths[k].item())
-            hij = hidden[k, :L_k, :]  # [L_k, d]  (패딩 제외)
+        # 4) 문자 스팬 + offset_mapping을 이용해 align_meta 계산
+        align_meta = [[None for _ in range(N)] for _ in range(B)]
 
+        for k in range(M):
+            b, n = meta[k]
+            L_k  = int(lengths[k].item())
+            hij  = hidden[k, :L_k, :]  # [L_k, d]
+
+            # 길이 패딩 (T_max까지)
             if L_k < T_max:
                 last_valid = hij[-1:, :]
                 pad = last_valid.repeat(T_max - L_k, 1)
                 hij = torch.cat([hij, pad], dim=0)  # [T_max, d]
 
-            prompt_token_emb[i, :, :, j] = hij
-            last_token_emb[i, :, j]      = hij[L_k - 1, :]  # 마지막 유효 토큰
+            prompt_token_emb[b, :, :, n] = hij
+            last_token_emb[b, :, n]      = hij[L_k - 1, :]
+
+            # --- align_meta 채우기 ---
+            numeric_spans = numeric_spans_list[k]     # [(value_float, [(cs,ce),...]), ...]
+            token_offsets = offsets[k].tolist()      # [(ts,te), ...] 길이 L_k
+
+            value_index_pairs = []
+
+            for value, spans_for_value in numeric_spans:
+                token_indices = set()
+                for (cs, ce) in spans_for_value:     # 문자 기준 [cs, ce)
+                    for tid in range(L_k):
+                        ts, te = token_offsets[tid]  # 문자 기준 [ts, te)
+                        # interval overlap check
+                        if te <= cs or ts >= ce:
+                            continue
+                        token_indices.add(tid)
+
+                if token_indices:
+                    value_index_pairs.append((value, sorted(token_indices)))
+
+            # fallback: 매칭 실패 시 마지막 유효 토큰에 붙여주기
+            if not value_index_pairs:
+                last_idx = L_k - 1
+                value_index_pairs.append((float('nan'), [last_idx]))
+
+            align_meta[b][n] = value_index_pairs
+            
+        # ============================================================
+        # -------------------- STRONG DEBUG --------------------------
+        # ============================================================
+
+        # try:
+        #     b, n = 0, 0
+        #     k = b * N + n
+        #     debug_prompt = prompts[k]
+        #     debug_offsets = offsets[k].tolist()
+
+        #     print("\n[DEBUG] ===================== ALIGN META CHECK =====================")
+        #     print(f"Prompt (first 200 chars):\n{debug_prompt[:200]} ...\n")
+
+        #     print("First 5 aligned values:")
+        #     for (value, tok_list) in align_meta[b][n][:5]:
+        #         print(f"\nValue = {value}")
+        #         for tid in tok_list:
+        #             if tid < len(debug_offsets):
+        #                 cs, ce = debug_offsets[tid]
+        #                 snippet = debug_prompt[cs:ce]
+        #                 print(f"  token {tid}: '{snippet}' (chars {cs}-{ce})")
+
+        #     print("[DEBUG] ============================================================\n")
+
+        # except Exception as e:
+        #     print(f"[DEBUG] strong debug skipped due to error: {e}")
+
+        # # ============================================================
 
         return last_token_emb, prompt_token_emb, align_meta
     # def generate_embeddings(self, in_data, in_data_mark):
