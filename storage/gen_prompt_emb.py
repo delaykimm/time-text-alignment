@@ -32,18 +32,6 @@ class GenPromptEmb(nn.Module):
         # for p in self.model.parameters():
         #     p.requires_grad = False
 
-        # # ------ position embedding extension -----
-        # new_max_pos = 2048
-        # self.model.config.n_positions = new_max_pos
-        # self.model.config.max_position_embeddings = new_max_pos
-        # self.model.config.ctx_len = 2048 
-        # old_wpe = self.model.wpe.weight.data  # [original_max, d_model]
-        # old_max_pos, d_model = old_wpe.shape
-
-        # new_wpe = nn.Embedding(new_max_pos, d_model).to(self.device)
-        # new_wpe.weight.data[:old_max_pos] = old_wpe
-        # new_wpe.weight.data[old_max_pos:] = old_wpe[-1].unsqueeze(0).repeat(new_max_pos - old_max_pos, 1)
-        # self.model.wpe = new_wpe
         # ==== [REPLACE in __init__ tokenizer/model init] ====
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token 
