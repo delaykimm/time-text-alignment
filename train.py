@@ -603,7 +603,7 @@ def time_step_alignment_loss(
     *, 
     detach_text=True, 
     reduce="mean",
-    use_contrastive=False,
+    use_contrastive=True,
     time_window=3,
     temperature=0.07,
     hard_negative_ratio=0.5
@@ -1850,13 +1850,14 @@ def main():
                 preds = engine.model(x, x_mark, last_emb, full_prompt)
                 test_outs.append(preds); test_ys.append(y)
         
-        # Test MSE 계산
-        test_pre = torch.cat(test_outs, 0)
-        test_real = torch.cat(test_ys, 0)
+        # Test MSE 계산 (매 epoch마다 - 참고용, 역변환 적용)
+        test_pre = torch.cat(test_outs, 0)  # [B_total, pred_len, N]
+        test_real = torch.cat(test_ys, 0)    # [B_total, pred_len, N]
+        
         amse, amae = [], []
         for j in range(args.pred_len):
             pred = test_pre[:, j,].to(device)
-            real = test_real[:, j, ].to(device)
+            real = test_real[:, j,].to(device)
             m = metric(pred, real)
             amse.append(m[0]); amae.append(m[1])
         
