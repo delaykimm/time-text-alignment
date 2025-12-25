@@ -1,58 +1,216 @@
-# TimeCMA-TS-Text Alignment
+# Time-Series × LLM Numeric-Text Alignment Research
 
-**TimeCMA-TS-Text Alignment**는 시계열 데이터의 수치 값을 LLM(Text) 임베딩 공간에 정렬(alignment)하여 **시계열 ↔ 자연어 표현**의 공통 표현 공간을 학습하는 프레임워크입니다.  
-이 프로젝트는 **시계열 예측 성능 향상**과 **수치-텍스트 의미 연결**을 동시에 달성하는 것을 목표로 합니다.
+## Overview
 
----
+본 연구는 **시계열 수치 정보(time-series values)를 자연어로 변환하여 LLM 임베딩 공간과 정렬(alignment)** 시키고, 이를 기반으로 **시계열 예측(time-series forecasting)** 성능을 향상시키는 모델 구조를 제안한다.
 
-## 📌 연구 개요
+### Key Ideas
 
-### 1. 문제 정의
-- 시계열 예측 모델은 수치 데이터에 강하지만, 자연어 기반 LLM은 수치 표현의 의미를 잘 학습하지 못하는 경우가 많음.
-- 예: `"23"`이라는 텍스트 토큰이 실제 시계열 값 23.0과 의미적으로 가까워지도록 학습.
-
-### 2. 방법론
-1. **시계열 인코더** → 채널별(Time-series) 임베딩 생성  
-2. **프롬프트 임베딩(LLM)** → 시계열 데이터를 자연어 문장으로 변환 후 LLM 임베딩 추출  
-3. **Cross-Modal Alignment**  
-   - **정렬 손실**:  
-     - (a) **Cosine Alignment Loss** – 시계열 임베딩 ↔ 해당 시점의 텍스트 토큰 임베딩 평균  
-     - (b) **Pairwise Distance MSE** – 두 임베딩 공간의 구조적 유사성 유지  
-4. **공통 공간 학습**: 예측 손실 + 정렬 손실의 가중합
+- 수치 → 텍스트 변환 후 GPT 임베딩 추출  
+- 시계열 encoder와 Text encoder 간 cross-modal alignment  
+- time flow + channel 정보를 모두 반영하는 alignment loss  
+- forecasting 성능 향상을 통한 정렬 효과 실증
 
 ---
 
-## 🛠 설치 방법
-```bash
-git clone https://github.com/username/TimeCMA-TS-Text.git
-cd TimeCMA-TS-Text
-conda create -n timecma python=3.10
-conda activate timecma
-pip install -r requirements.txt
+## Core Motivation
+
+### Problem
+
+기존 time-series–text alignment 기법들은 다음과 같은 한계를 가진다.
+
+- 시계열 구간 단위의 channel-wise alignment 또는 attention score 학습에 머물러 거친 정렬만 수행  
+- 정렬의 기준(reference)이 되는 명시적 의미 기준점 부재  
+- 단순 패턴 매칭에 의존하여 의미적 prototype 정렬이 어려움  
+
+→ 결과적으로 왜 특정 시계열 표현이 특정 의미와 연결되는지 해석하기 어렵다.
+
+### Our Solution
+
+1. 수치 값을 자연어 prompt로 변환하여 LLM의 언어 기반 수치 priors 활용  
+2. GPT-2 임베딩을 semantic reference space로 사용 (파라미터 freeze)  
+3. Time-series encoder만 학습하여 시계열 표현을 LLM 임베딩 공간으로 사상  
+4. Time alignment + Channel alignment + Forecasting loss 공동 최적화
+
+---
+
+## System Architecture
+
+### Embedding Pipeline
+
+- `GenPromptEmb` : 숫자 + timestamp → 자연어 prompt 생성  
+- GPT-2 tokenizer + model → 마지막 토큰 임베딩 추출  
+- `.h5` 형태로 embedding 저장 (`anchor_avg`, `prompt_token_embeddings` 등)
+
+---
+
+## Project Structure
+
+<pre>
+.
+├── data_provider/
+│   ├── data_loader_emb.py
+│   └── data_loader_save.py
+├── storage/
+│   ├── gen_prompt_emb.py
+│   └── store_emb.py
+├── embeddings/
+│   └── ETTh1_96.h5
+├── datasets/
+│   └── ETTh1.csv
+└── train.py
+</pre>
+---
+
+## Data Structure
+
+### Datasets
+
+- ETTh1  
+- ILI
+
+### Sliding Window
+
+- stride = 8  
+- seq_len ∈ {96, 192, 336, 720}
+
+### HDF5 Example
+(32, 551, 768, 7)
+(batch_size, num_tokens, model_dim, channel)
+
+---
+
+## Key Losses
+
+```text
+loss = loss_pred 
+     + λ_c * loss_align_channel 
+     + λ_t * loss_align_time
 ```
 
-## 🚀 실행 예시
+- Forecasting Loss (MSE)  
+- Time Alignment Loss   (loss_align_channel)
+- Channel Alignment Loss   (loss_align_time)
+
+---
+
+## Codebase
+
+| File | Description |
+|------|-------------|
+| train.py | training pipeline |
+| data_loader_emb.py | h5-based dataloader |
+| data_loader_save.py | embedding generator loader |
+| gen_prompt_emb.py | prompt generation |
+| store_emb.py | embedding storage |
+
+---
+
+## How to Run
+
+### 1. Generate Embeddings
+
+```bash
+python ./storage/store_emb.py \
+  --data_path ETTh1 \
+  --divide 96 \
+  --batch_size gpt2 \
+  --save_path ./embeddings/ETTh1_96.h5
+```
+<pre>
+--data_path    : Time-series dataset name
+--divide       : Data split mode (train / valid / test)
+</pre>
+
+### 2. Train Model
 ```bash
 python train.py \
-  --data_path ./dataset/ETTm1.csv \
-  --model_name TimeCMA \
-  --seq_len 96 \
-  --pred_len 24 \
-  --batch_size 32 \
-  --learning_rate 0.0005 \
-  --align_weight 1.5
+  --data_path ETTh1 \
+  --batch_size 16 \
+  --epochs 70 \
+  --stride 8 \
+  --align_weight 1.0 \
+  --align_weight_time 0.5 \
+  --time_window 4
 ```
+<pre>
+--pred_len            : Prediction horizon length
+--data_path           : Dataset name (e.g., ETTh1, ILI)
+--batch_size          : Training batch size
+--epochs              : Number of training epochs
+--stride              : Sliding window shift 
+                        (smaller value → more samples, higher computation)
+--align_weight        : Weight for channel-wise alignment loss
+--align_weight_time   : Weight for temporal alignment loss
+--time_window         : Temporal positive range for alignment
+                        (e.g., 5 → ±2 time steps considered positive pairs)
+</pre>
 
-## 📊 실험 설정
-- 데이터셋: ETT(Electricity Transformer Temperature)
-- 모델 구조:
-      Time-series Encoder (Transformer 기반)
-      GPT-2 기반 LLM 임베딩
-- 손실 구성:
-      **1. Prediction Loss(MAE/MSE) - 시계열 예측**
-      **2. Alignment Loss - 수치 <-> 텍스트 정렬 (숫자 토큰 기반)**
-        Cosine Alignment
-        Pairwise Distance MSE
+---
 
+## Baseline
 
+We compare our model with TimeCMA using identical settings:
+- batch_size = 16
+- epochs = 70
+- stride = 8
 
+---
+
+## Expected Result & Analysis
+
+### ETTh1 Dataset (epoch = 70, align_channel = 0.1, align_time = 0.3, stide= 8))
+
+<pre>
+pred_len | Metric | TimeCMA | Ours(MY) | Delta
+------------------------------------------------
+96       | MSE    | 0.3985  | 0.3961   | -0.0024
+96       | MAE    | 0.4194  | 0.4178   | -0.0016
+192      | MSE    | 0.4529  | 0.4417   | -0.0112
+192      | MAE    | 0.4480  | 0.4411   | -0.0069
+336      | MSE    | 0.4882  | 0.4848   | -0.0034
+336      | MAE    | 0.4636  | 0.4630   | -0.0006
+720      | MSE    | 0.5198  | 0.4915   | -0.0283
+720      | MAE    | 0.5038  | 0.4808   | -0.0230
+</pre>
+
+Analysis
+	•	MY outperforms TimeCMA across all prediction horizons.
+	•	Largest gains are observed at pred_len=192 and 720.
+	•	Maximum improvement at pred_len=720: MSE -0.0283, MAE -0.0230.
+This shows that numeric–text alignment remains effective even for long-horizon forecasting on ETTh1.
+
+### ILI (seq_len=36, epoch=100, stride=2)
+
+<pre>
+pred_len | Metric | TimeCMA | Ours(MY) | Delta
+------------------------------------------------
+24       | MSE    | 2.4568  | 1.6837   | -0.7731
+24       | MAE    | 0.9561  | 0.8438   | -0.1123
+36       | MSE    | 1.9894  | 1.8832   | -0.1062
+36       | MAE    | 0.9472  | 0.8842   | -0.0630
+48       | MSE    | 2.2464  | 2.3041   | +0.0577
+48       | MAE    | 0.9951  | 0.9844   | -0.0107
+60       | MSE    | 1.8181  | 2.0267   | +0.2086
+60       | MAE    | 0.8754  | 0.9287   | +0.0533
+</pre>
+
+Analysis
+	•	Strong improvements for short horizons (pred_len=24, 36), including a 31.5% MSE reduction at pred_len=24.
+	•	For pred_len ≥ 48, performance degrades, indicating that alignment is most effective for short-term forecasting under distribution shift.
+
+---
+
+### Why This Matters
+- LLM의 수치 이해 한계를 극복
+- 시계열–언어 간 의미적 정렬 가능
+- 최소 파라미터 학습으로 효율적 구조
+  
+-----
+
+## Summary
+
+“숫자를 언어 공간으로 끌어올리고, 언어적 의미를 시계열 예측에 투입한다.”
+
+본 연구는 LLM의 언어적 표현 능력을 시계열 문제에 직접 연결하여
+alignment 기반 forecasting 성능 향상을 달성하는 것을 목표로 한다.
