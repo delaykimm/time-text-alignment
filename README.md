@@ -4,6 +4,18 @@
 
 본 연구는 **시계열 수치 정보(time-series values)를 자연어로 변환하여 LLM 임베딩 공간과 정렬(alignment)** 시키고, 이를 기반으로 **시계열 예측(time-series forecasting)** 성능을 향상시키는 모델 구조를 제안한다.
 
+## Environment Setup
+<pre>
+Python >= 3.10
+CUDA 11.8+ recommended
+
+Dependencies are listed in requirements.txt.
+
+Install all dependencies with:
+
+pip install -r requirements.txt
+</pre>
+
 ### Key Ideas
 
 - 수치 → 텍스트 변환 후 GPT 임베딩 추출  
@@ -42,41 +54,76 @@
 - GPT-2 tokenizer + model → 마지막 토큰 임베딩 추출  
 - `.h5` 형태로 embedding 저장 (`anchor_avg`, `prompt_token_embeddings` 등)
 
+### Prompt Generation Example
+
+The following example illustrates how raw numeric time-series values are converted into natural-language prompts before being encoded by GPT-2.
+
+Raw time-series values:
+<pre>
+[23, 4, 10.5]
+</pre>
+Corresponding generated prompt:
+<pre>
+From [t1] to [t2], the values were twenty three, four, and ten point five every hour.
+The total trend value was minus twelve point five.
+</pre>
+This prompt explicitly expresses numeric values in natural language to leverage the LLM’s pretrained numerical and semantic understanding, providing a semantic reference space for numeric–text alignment.
+
 ---
 
 ## Project Structure
 
 <pre>
-.
 ├── data_provider/
 │   ├── data_loader_emb.py
 │   └── data_loader_save.py
+├── layers/
+├── models/
+├── scripts/
 ├── storage/
 │   ├── gen_prompt_emb.py
 │   └── store_emb.py
-├── embeddings/
-│   └── ETTh1_96.h5
-├── datasets/
-│   └── ETTh1.csv
+├── utils/
 └── train.py
 </pre>
+
 ---
 
-## Data Structure
+## Data Preparation
 
-### Datasets
+Download raw datasets from the official repositories:
 
-- ETTh1  
-- ILI
+ETTh1 : https://github.com/zhouhaoyi/ETDataset  
+ILI   : https://github.com/thuml/Autoformer
 
-### Sliding Window
+Place the raw CSV files as:
 
-- stride = 8  
-- seq_len ∈ {96, 192, 336, 720}
+datasets/ETTh1.csv  
+datasets/ILI.csv
 
-### HDF5 Example
+## Embedding Generation
+
+Run the following command to convert raw time-series values into
+numeric–text prompt embeddings stored in HDF5 format.
+
+```bash
+python storage/store_emb.py \
+  --data_path ETTh1 \
+  --divide 96 \
+  --save_path embeddings/ETTh1_96.h5
+```
+
+## Data Structure (Embedding format)
+
+Each HDF5 file contains numeric–text embeddings
+generated from raw time-series values.
+
+Example shape:
+
 (32, 551, 768, 7)
 (batch_size, num_tokens, model_dim, channel)
+
+Each time-series sample is segmented into multiple sliding windows, and each window is converted into a natural-language prompt and encoded by GPT-2 at the token level. These multiple prompt-window embeddings are stored per sample in the HDF5 file.
 
 ---
 
@@ -89,8 +136,11 @@ loss = loss_pred
 ```
 
 - Forecasting Loss (MSE)  
-- Time Alignment Loss   (loss_align_channel)
-- Channel Alignment Loss   (loss_align_time)
+- Time Alignment Loss   (loss_align_time)
+- Channel Alignment Loss   (loss_align_channel)
+
+These three losses are jointly optimized to align temporal structure,
+channel-wise semantics, and forecasting accuracy.
 
 ---
 
@@ -105,6 +155,17 @@ loss = loss_pred
 | store_emb.py | embedding storage |
 
 ---
+```md
+## Quick Start
+The following commands reproduce the full pipeline from raw data to forecasting.
+```
+```bash
+# Step 1. Generate numeric-text embeddings
+python storage/store_emb.py --data_path ETTh1 --divide train --batch_size 32
+
+# Step 2. Train forecasting model
+python train.py --epochs 70 --data_path ETTh1 --use_contrastive --time_window 3 --batch_size 16 --stride 8 --align_weight 0.3 --align_weight_time 0.1
+```
 
 ## How to Run
 
@@ -113,9 +174,8 @@ loss = loss_pred
 ```bash
 python ./storage/store_emb.py \
   --data_path ETTh1 \
-  --divide 96 \
-  --batch_size gpt2 \
-  --save_path ./embeddings/ETTh1_96.h5
+  --divide train \
+  --batch_size 32
 ```
 <pre>
 --data_path    : Time-series dataset name
@@ -159,7 +219,7 @@ We compare our model with TimeCMA using identical settings:
 
 ## Expected Result & Analysis
 
-### ETTh1 Dataset (epoch = 70, align_channel = 0.1, align_time = 0.3, stide= 8))
+### ETTh1 Dataset (epoch = 70, align_channel = 0.1, align_time = 0.3, stride= 8)
 
 <pre>
 pred_len | Metric | TimeCMA | Ours(MY) | Delta
@@ -175,9 +235,9 @@ pred_len | Metric | TimeCMA | Ours(MY) | Delta
 </pre>
 
 Analysis
-	•	MY outperforms TimeCMA across all prediction horizons.
-	•	Largest gains are observed at pred_len=192 and 720.
-	•	Maximum improvement at pred_len=720: MSE -0.0283, MAE -0.0230.
+	- MY outperforms TimeCMA across all prediction horizons.
+	- Largest gains are observed at pred_len=192 and 720.
+	- Maximum improvement at pred_len=720: MSE -0.0283, MAE -0.0230.
 This shows that numeric–text alignment remains effective even for long-horizon forecasting on ETTh1.
 
 ### ILI (seq_len=36, epoch=100, stride=2)
@@ -196,8 +256,8 @@ pred_len | Metric | TimeCMA | Ours(MY) | Delta
 </pre>
 
 Analysis
-	•	Strong improvements for short horizons (pred_len=24, 36), including a 31.5% MSE reduction at pred_len=24.
-	•	For pred_len ≥ 48, performance degrades, indicating that alignment is most effective for short-term forecasting under distribution shift.
+	- Strong improvements for short horizons (pred_len=24, 36), including a 31.5% MSE reduction at pred_len=24.
+	- For pred_len ≥ 48, performance degrades, indicating that alignment is most effective for short-term forecasting under distribution shift.
 
 ---
 
