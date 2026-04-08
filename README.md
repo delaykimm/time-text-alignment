@@ -1,8 +1,10 @@
 # Time-Series × LLM Numeric-Text Alignment Research
 
-## Overview
+## Summary
+A semantically grounded time-series forecasting framework that uses **numbers as the semantic bridge** between time-series and the language semantic space of LLMs.
 
-This project explores a new time-series–LLM alignment framework in which numbers serve as the main alignment criterion. Through numeric-to-text conversion, it seeks to build more interpretable and semantically grounded forecasting models.
+## Overview
+This project investigates a new time-series–LLM alignment framework in which **numbers serve as the core alignment criterion**. By converting numeric values into natural-language expressions, the framework aligns time-series representations with the language semantic space of LLMs to build more interpretable and semantically grounded forecasting models.## Overview
 
 ## Environment Setup
 <pre>
@@ -20,39 +22,36 @@ pip install -r requirements.txt
 
 ## Core Motivation
 
-Existing time-series-LLM alignment methods have the following limitations.
-
 ### Problem
-	- Existing methods are often limited to coarse, channel-wise alignment.
-	- Paired time-series–text data is scarce, making explicit cross-modal semantic grounding difficult.
-	- Attention-based matching does not guarantee true semantic alignment.
-	- Soft prompts are not human-interpretable, and even natural-language prompts often leave a substantial modality gap unresolved.
-	
-→ This makes the learned alignment hard to interpret and trust.
+Existing time-series–text alignment methods still suffer from several limitations:
+
+- They often rely on **coarse, channel-wise alignment**, without fully capturing temporal semantics across time.
+- **Paired time-series–text data is scarce**, making explicit cross-modal semantic grounding difficult.
+- **Attention-based matching** with textual anchors or prototypes does not guarantee true semantic alignment.
+- Prompt-based approaches remain limited: some rely on **soft prompts** that are not human-interpretable, while others still suffer from a substantial **modality gap** between time-series embeddings and text representations.
+
+→ As a result, it remains unclear why a specific time-series pattern is linked to a particular textual meaning, limiting interpretability and trustworthiness.
 
 ### Key Insight
-
-	- Numbers are the shared semantic unit between time-series and text.
-	- Time-series should be aligned to the language semantic space of LLMs, rather than forcing LLMs to adapt to raw time-series inputs.
-	- Human-interpretable numeric text can provide a more reliable basis for semantic alignment.
+- **Numbers are the shared semantic unit between time-series and text.**
+- Instead of forcing LLMs to directly process raw time-series values, a more principled approach is to **align time-series representations with the language semantic space of LLMs**.
+- Converting numeric values into **human-interpretable natural-language expressions** provides a meaningful basis for semantic alignment.
 
 ### Our Solution
-
-	- Convert numeric values into natural-language prompts so that LLMs can encode them in a semantically meaningful form.
-	- Use frozen GPT-2 embeddings as a semantic reference space.
-	- Train only the time-series encoder to align temporal representations with these text-derived embeddings.
-	- Design an alignment objective that captures both time flow and channel information, enabling fine-grained cross-modal alignment.
-	- Jointly optimize alignment and forecasting objectives to show that semantically grounded alignment improves both interpretability and forecasting performance.
-
----
-
+- Convert **numeric values and timestamps into natural-language prompts**.
+- Use **frozen GPT-2 embeddings** as a text-derived semantic reference space.
+- Train the **time-series encoder** to align with these semantic embeddings.
+- Design an alignment objective that captures both **temporal flow and channel structure**.
+- Jointly optimize alignment and forecasting objectives to improve both **interpretability and forecasting performance**.
+  
 ## Key Ideas
 
-- Use numbers as the core alignment criterion between time-series and text.
-- Convert numeric values and timestamps into natural-language prompts.
-- Use frozen GPT-2 embeddings as semantic references.
-- Capture both temporal flow and channel structure in the alignment design.
-- Validate semantic alignment through forecasting performance and interpretability.
+- **Numbers as the core alignment criterion**
+- **Numeric-to-text prompt conversion**
+- **Frozen GPT-2 embeddings as semantic references**
+- **Time-series encoder alignment in the LLM space**
+- **Temporal flow + channel-aware alignment**
+- **Forecasting-based validation of semantic alignment**
 
 ---
 ## System Architecture
@@ -273,9 +272,4 @@ Analysis
 ### Why This Matters
 - Cross-modal alignment without pair supervision
 - Semantically map the time-series modality into the LLM embedding space
-  
------
-
-## Summary
-
-A semantically grounded time-series forecasting framework that uses numbers as the alignment bridge between time-series and the language semantic space of LLMs. 
+- 
