@@ -2,7 +2,7 @@
 
 ## Overview
 
-본 연구는 **시계열 수치 정보(time-series values)를 자연어로 변환하여 LLM 임베딩 공간과 정렬(alignment)** 시키고, 이를 기반으로 **시계열 예측(time-series forecasting)** 성능을 향상시키는 모델 구조를 제안한다.
+This project explores a new time-series–LLM alignment framework in which numbers serve as the main alignment criterion. Through numeric-to-text conversion, it seeks to build more interpretable and semantically grounded forecasting models.
 
 ## Environment Setup
 <pre>
@@ -16,12 +16,6 @@ Install all dependencies with:
 pip install -r requirements.txt
 </pre>
 
-### Key Ideas
-
-- 시계열의 숫자값을 자연어 표현으로 바꾸고,
-- 그로부터 얻은 LLM 임베딩을 의미적 기준점으로 삼아 시계열 표현을 정렬함으로써,
-- forecasting 성능과 해석 가능성을 함께 높임
-
 ---
 
 ## Core Motivation
@@ -29,31 +23,38 @@ pip install -r requirements.txt
 Existing time-series-LLM alignment methods have the following limitations.
 
 ### Problem
-
-- Rely on **coarse pattern matching** rather than semantically grounded alignment.
-- Many approaches focus only on **channel-wise correspondence**, without capturing the full temporal semantics across time.
-- Soft prompts or encoded inputs are often optimized for forecasting performance, not for leveraging the **semantic strengths of LLMs**.
-- Attention-based matching with textual anchors or prototypes does not guarantee **true semantic alignment**.
-  
--> It remains unclear why a specific time-series pattern is linked to a particular textual meaning, limiting **interpretability and trustworthiness**.
+	- Existing methods are often limited to coarse, channel-wise alignment.
+	- Paired time-series–text data is scarce, making explicit cross-modal semantic grounding difficult.
+	- Attention-based matching does not guarantee true semantic alignment.
+	- Soft prompts are not human-interpretable, and even natural-language prompts often leave a substantial modality gap unresolved.
+	
+→ This makes the learned alignment hard to interpret and trust.
 
 ### Key Insight
 
-We argue that the goal should not be to force LLMs to process raw time-series values directly, but to align time-series representations with the semantic space of language.
-
-Numbers provide a natural bridge between the two modalities:
-- they are the native building blocks of time-series,
-- and they can also be explicitly expressed in natural language.
+	- Numbers are the shared semantic unit between time-series and text.
+	- Time-series should be aligned to the language semantic space of LLMs, rather than forcing LLMs to adapt to raw time-series inputs.
+	- Human-interpretable numeric text can provide a more reliable basis for semantic alignment.
 
 ### Our Solution
 
-1. Convert numeric values into natural-language prompts so that LLMs can encode them in a semantically meaningful form.
-2. Use frozen GPT-2 embeddings as a semantic reference space.
-3. Train only the time-series encoder to align temporal representations with these text-derived embeddings.
-4. Jointly optimize forecasting, time alignment, and channel alignment losses for fine-grained semantic grounding
+	- Convert numeric values into natural-language prompts so that LLMs can encode them in a semantically meaningful form.
+	- Use frozen GPT-2 embeddings as a semantic reference space.
+	- Train only the time-series encoder to align temporal representations with these text-derived embeddings.
+	- Design an alignment objective that captures both time flow and channel information, enabling fine-grained cross-modal alignment.
+	- Jointly optimize alignment and forecasting objectives to show that semantically grounded alignment improves both interpretability and forecasting performance.
 
 ---
 
+## Key Ideas
+
+	- Use numbers as the core alignment criterion between time-series and text.
+	- Convert numeric values and timestamps into natural-language prompts.
+	- Use frozen GPT-2 embeddings as semantic references.
+	- Capture both temporal flow and channel structure in the alignment design.
+	- Validate semantic alignment through forecasting performance and interpretability.
+
+---
 ## System Architecture
 
 ### Embedding Pipeline
@@ -270,13 +271,11 @@ Analysis
 ---
 
 ### Why This Matters
-- cross-modal alignment without pair supervision
+- Cross-modal alignment without pair supervision
 - Semantically map the time-series modality into the LLM embedding space
   
 -----
 
 ## Summary
 
-"숫자를 자연어 표현으로 전환하고, 그 언어적 의미를 시계열 표현 학습에 반영한다."
-
-본 연구는 LLM의 semantic space와의 alignment를 통해 forecasting 성능 향상과 해석 가능성 제고를 목표로 한다.
+A semantically grounded time-series forecasting framework that uses numbers as the alignment bridge between time-series and the language semantic space of LLMs. 
