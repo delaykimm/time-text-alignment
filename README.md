@@ -48,11 +48,11 @@ Existing time-series-LLM alignment methods have the following limitations.
 
 ## Key Ideas
 
-	- Use numbers as the core alignment criterion between time-series and text.
-	- Convert numeric values and timestamps into natural-language prompts.
-	- Use frozen GPT-2 embeddings as semantic references.
-	- Capture both temporal flow and channel structure in the alignment design.
-	- Validate semantic alignment through forecasting performance and interpretability.
+- Use numbers as the core alignment criterion between time-series and text.
+- Convert numeric values and timestamps into natural-language prompts.
+- Use frozen GPT-2 embeddings as semantic references.
+- Capture both temporal flow and channel structure in the alignment design.
+- Validate semantic alignment through forecasting performance and interpretability.
 
 ---
 ## System Architecture
