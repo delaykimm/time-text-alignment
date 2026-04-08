@@ -18,31 +18,39 @@ pip install -r requirements.txt
 
 ### Key Ideas
 
-- 수치 → 텍스트 변환 후 GPT 임베딩 추출  
-- 시계열 encoder와 Text encoder 간 cross-modal alignment  
-- time flow + channel 정보를 모두 반영하는 alignment loss  
-- forecasting 성능 향상을 통한 정렬 효과 실증
+- 시계열의 숫자값을 자연어 표현으로 바꾸고,
+- 그로부터 얻은 LLM 임베딩을 의미적 기준점으로 삼아 시계열 표현을 정렬함으로써,
+- forecasting 성능과 해석 가능성을 함께 높임
 
 ---
 
 ## Core Motivation
 
+Existing time-series-LLM alignment methods have the following limitations.
+
 ### Problem
 
-기존 time-series–text alignment 기법들은 다음과 같은 한계를 가진다.
+- Rely on **coarse pattern matching** rather than semantically grounded alignment.
+- Many approaches focus only on **channel-wise correspondence**, without capturing the full temporal semantics across time.
+- Soft prompts or encoded inputs are often optimized for forecasting performance, not for leveraging the **semantic strengths of LLMs**.
+- Attention-based matching with textual anchors or prototypes does not guarantee **true semantic alignment**.
+  
+-> It remains unclear why a specific time-series pattern is linked to a particular textual meaning, limiting **interpretability and trustworthiness**.
 
-- 시계열 구간 단위의 channel-wise alignment 또는 attention score 학습에 머물러 거친 정렬만 수행  
-- 정렬의 기준(reference)이 되는 명시적 의미 기준점 부재  
-- 단순 패턴 매칭에 의존하여 의미적 prototype 정렬이 어려움  
+### Key Insight
 
-→ 결과적으로 왜 특정 시계열 표현이 특정 의미와 연결되는지 해석하기 어렵다.
+We argue that the goal should not be to force LLMs to process raw time-series values directly, but to align time-series representations with the semantic space of language.
+
+Numbers provide a natural bridge between the two modalities:
+- they are the native building blocks of time-series,
+- and they can also be explicitly expressed in natural language.
 
 ### Our Solution
 
-1. 수치 값을 자연어 prompt로 변환하여 LLM의 언어 기반 수치 priors 활용  
-2. GPT-2 임베딩을 semantic reference space로 사용 (파라미터 freeze)  
-3. Time-series encoder만 학습하여 시계열 표현을 LLM 임베딩 공간으로 사상  
-4. Time alignment + Channel alignment + Forecasting loss 공동 최적화
+1. Convert numeric values into natural-language prompts so that LLMs can encode them in a semantically meaningful form.
+2. Use frozen GPT-2 embeddings as a semantic reference space.
+3. Train only the time-series encoder to align temporal representations with these text-derived embeddings.
+4. Jointly optimize forecasting, time alignment, and channel alignment losses for fine-grained semantic grounding
 
 ---
 
@@ -50,9 +58,9 @@ pip install -r requirements.txt
 
 ### Embedding Pipeline
 
-- `GenPromptEmb` : 숫자 + timestamp → 자연어 prompt 생성  
-- GPT-2 tokenizer + model → 마지막 토큰 임베딩 추출  
-- `.h5` 형태로 embedding 저장 (`anchor_avg`, `prompt_token_embeddings` 등)
+- `GenPromptEmb` : Numeric values + timestamps → natural-language prompt  
+- GPT-2 tokenizer + model → extracts the last-token embedding  
+- saves embeddings in `.h5` format (`anchor_avg`, `prompt_token_embeddings` etc.)
 
 ### Prompt Generation Example
 
@@ -262,15 +270,13 @@ Analysis
 ---
 
 ### Why This Matters
-- LLM의 수치 이해 한계를 극복
-- 시계열–언어 간 의미적 정렬 가능
-- 최소 파라미터 학습으로 효율적 구조
+- cross-modal alignment without pair supervision
+- Semantically map the time-series modality into the LLM embedding space
   
 -----
 
 ## Summary
 
-“숫자를 언어 공간으로 끌어올리고, 언어적 의미를 시계열 예측에 투입한다.”
+"숫자를 자연어 표현으로 전환하고, 그 언어적 의미를 시계열 표현 학습에 반영한다."
 
-본 연구는 LLM의 언어적 표현 능력을 시계열 문제에 직접 연결하여
-alignment 기반 forecasting 성능 향상을 달성하는 것을 목표로 한다.
+본 연구는 LLM의 semantic space와의 alignment를 통해 forecasting 성능 향상과 해석 가능성 제고를 목표로 한다.
